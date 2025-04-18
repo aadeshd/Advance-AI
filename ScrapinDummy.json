@@ -1,0 +1,77 @@
+{
+  "name": "John Doe",
+  "headline": "Data Scientist | AI Enthusiast | Python Developer",
+  "location": "San Francisco Bay Area",
+  "summary": "Experienced data scientist with a passion for building scalable machine learning models and solving complex problems using data. Skilled in Python, TensorFlow, and cloud computing.",
+  "connections": 500,
+  "profile_url": "https://www.linkedin.com/in/johndoe",
+  "experiences": [
+    {
+      "title": "Senior Data Scientist",
+      "company": "Tech Innovators Inc.",
+      "location": "San Francisco, CA",
+      "start_date": "Jan 2022",
+      "end_date": "Present",
+      "description": "Leading a team of data scientists to develop machine learning models for predictive analytics. Implemented scalable solutions using AWS and Docker."
+    },
+    {
+      "title": "Data Scientist",
+      "company": "NextGen Analytics",
+      "location": "Remote",
+      "start_date": "Jul 2019",
+      "end_date": "Dec 2021",
+      "description": "Developed NLP models for customer feedback analysis and contributed to a 15% increase in client satisfaction."
+    }
+  ],
+  "education": [
+    {
+      "school": "Stanford University",
+      "degree": "Master of Science",
+      "field_of_study": "Computer Science",
+      "start_date": "2017",
+      "end_date": "2019"
+    },
+    {
+      "school": "University of California, Berkeley",
+      "degree": "Bachelor of Science",
+      "field_of_study": "Statistics",
+      "start_date": "2013",
+      "end_date": "2017"
+    }
+  ],
+  "skills": [
+    "Python",
+    "Machine Learning",
+    "Deep Learning",
+    "Data Visualization",
+    "SQL",
+    "TensorFlow",
+    "Natural Language Processing",
+    "AWS",
+    "Docker"
+  ],
+  "certifications": [
+    {
+      "name": "AWS Certified Machine Learning – Specialty",
+      "issuer": "Amazon Web Services",
+      "date": "Nov 2021"
+    }
+  ],
+  "languages": [
+    {
+      "language": "English",
+      "proficiency": "Native or bilingual proficiency"
+    },
+    {
+      "language": "Spanish",
+      "proficiency": "Professional working proficiency"
+    }
+  ],
+  "projects": [
+    {
+      "name": "Customer Churn Prediction",
+      "description": "Built a churn prediction model for a telecom company that reduced customer attrition by 12%.",
+      "url": "https://github.com/johndoe/churn-prediction"
+    }
+  ]
+}
