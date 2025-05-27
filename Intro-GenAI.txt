@@ -1,0 +1,88 @@
+Gen AI
+  AI system that can generate high quality content specially text, image and audio
+  e.g. Google Gemini/Bard, OpenAI ChatGPT, Microsoft Bing, Deepseek v3 etc.
+
+Hallicunation - Sometimes LLM can make things up (with confidence)
+
+LLM can be used for,
+1. Reading - Generate similar or smaller length output (Check Grammar, Sentiment Analysis, Summarization)
+2. Writing - Given small prompt, come up with large text (Write Email, Write Blog)
+3. Chatting - Conversation (Chatbot)
+
+Types of LLM
+1. Web based - Web based interface app (Chatgpt)
+2. Software based - LLM Integrated in software (Email analysis App)
+
+LLM Limitation/ Can not do -
+1. Knowledge Cut off 
+  - No information of recent or post training events
+  - Knows things till certain time/ till training time
+2. Hallicunation
+  - Sometimes can make things up with confidence
+3. Token limit 
+  - Input and output length is limited
+  - Context length = Input length + Output Length
+4. Do not work well with tabular data
+5. Bias and Toxicity
+
+Token
+  - Either a word or a subpart of a word in imput prompt or output generated
+  e.g. Common word - The, Andrew -> 1 Token
+      Less common word - Programming -> 2 Token (Program, ming)
+      less common words might get split into 2 or more tokens.
+
+Lifecycle of Gen AI Project
+1. Scope project
+2. Build system (Working Prototype)
+3. Internal Evaluation (Check all scenarios)
+  3.1 Retrain/Improvment in required as per evaluation
+4. Deploy and Monitor (Let end user use it; closely monitor the output, Internal Evaluation or Improve model as per requirement)
+Building Gen AI project is highly iterative process
+We repeatedly find and fix mistake
+
+Tools/techniques to improve LLM
+1. Prompting
+  - Be detailed and specific
+  - Guide the model to think through
+  - Experiment & Iterate
+2. RAG
+  - Retrival Augmented Generation
+  - Expand what LLMs can do by providing additional knowledge what it may have learned from internet or any open source data.
+  e.g. Q - Is there parking for employee?
+      Without RAG Ans - I may need additional info about your company
+      With RAG Ans - You can park on Level 2 and level 4.
+  - Steps
+  1. Given question, search for relevant docs for answers
+  2. Incorporate retrived information into an updated prompt
+      (Considering token limit, instead of passing entire doc, you should pass only relevant section)
+  3. Generate answer from new prompt with additional information
+3. finetuning
+  - LLm to do little training to change its output to be in expected way
+  - Used whem task can not be define in prompt
+    e.g. Summarize a call center call in a certain format or Mimicking writing or speaking style of a person
+  - To help LLM gain specific knowledge
+    e.g. legal docs, Medical Text
+  - To use smaller model to do specific task
+4. pre training
+  - very Expensive
+  - Huge amount of data required
+  - Heavy resources
+
+- LLMs have huge General Knowledge but they do not know everything
+- By providing required info/context we can ask LLM to process it
+- Use LLM as a Reasoning Engine rather than using it as Source of Information
+
+How to Choose LLM
+- Size
+  1 B param - Pattern matching and basic GK (good for basic task - Restaurant Review Analysis)
+  10 B Param - Better GK and follow basic instruction (Chatbot to order item)
+  100 B+ Param - Rich GK and Complex reasoning (Brainstorming partner)
+- Open source or close
+  Close
+  - Easy to use 
+  - More powerful model
+  - Less expensive
+  - May have vendor lock in
+  Open
+  - Full control over Model
+  - Full control over data
