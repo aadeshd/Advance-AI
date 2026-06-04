@@ -1,273 +1,3 @@
-redis
-AWSTemplateFormatVersion: "2010-09-09"
-Description: "AgentCore VPC - Redis (ElastiCache + Security Groups + Subnet Group)"
-
-Parameters:
-
-  VpcId:
-    Type: AWS::EC2::VPC::Id
-    Default: vpc-0f35f404b89ae206c
-
-  PrivateSubnetIds:
-    Type: List<AWS::EC2::Subnet::Id>
-    Default: subnet-013d5e15202ffa634,subnet-0c5f6f1e835faeb9d
-
-  RedisPort:
-    Type: Number
-    Default: 6379
-
-  RedisNodeType:
-    Type: String
-    Default: cache.t3.small
-
-  NumCacheClusters:
-    Type: Number
-    Default: 1
-
-  EnableTransitEncryption:
-    Type: String
-    AllowedValues: ["true", "false"]
-    Default: "false"
-
-  RedisAuthToken:
-    Type: String
-    NoEcho: true
-    Default: ""
-
-  # The Lambda SG from the lambda stack needs ingress into Redis.
-  # Pass it here if the lambda stack is deployed first, or use a separate
-  # ingress rule update after both stacks are up.
-  # Keeping the existing hardcoded SG reference for parity with original template.
-  ExternalSourceSecurityGroupId:
-    Type: String
-    Default: sg-07914e60aee7a0c4f
-    Description: "Additional SG allowed to reach Redis (e.g. bastion / existing agent SG)"
-
-Conditions:
-  UseTLS: !Equals [!Ref EnableTransitEncryption, "true"]
-  UseAuthToken: !Not [!Equals [!Ref RedisAuthToken, ""]]
-
-Resources:
-
-  AgentLambdaSecurityGroup:
-    Type: AWS::EC2::SecurityGroup
-    Properties:
-      GroupDescription: "Agent Lambda SG"
-      VpcId: !Ref VpcId
-      SecurityGroupEgress:
-        - IpProtocol: "-1"
-          CidrIp: 0.0.0.0/0
-
-  AgentRedisSecurityGroup:
-    Type: AWS::EC2::SecurityGroup
-    Properties:
-      GroupDescription: "Agent Redis SG"
-      VpcId: !Ref VpcId
-      SecurityGroupIngress:
-        - IpProtocol: tcp
-          FromPort: !Ref RedisPort
-          ToPort: !Ref RedisPort
-          SourceSecurityGroupId: !Ref AgentLambdaSecurityGroup
-        - IpProtocol: tcp
-          FromPort: !Ref RedisPort
-          ToPort: !Ref RedisPort
-          SourceSecurityGroupId: !Ref ExternalSourceSecurityGroupId
-
-  AgentRedisSubnetGroup:
-    Type: AWS::ElastiCache::SubnetGroup
-    Properties:
-      Description: "Agent Redis subnet group"
-      SubnetIds: !Ref PrivateSubnetIds
-
-  AgentRedisReplicationGroup:
-    Type: AWS::ElastiCache::ReplicationGroup
-    Properties:
-      ReplicationGroupId: !Sub "agent-redis-${AWS::StackName}"
-      ReplicationGroupDescription: "Agent Redis cluster"
-      Engine: redis
-      CacheNodeType: !Ref RedisNodeType
-      NumCacheClusters: !Ref NumCacheClusters
-      AutomaticFailoverEnabled: false
-      Port: !Ref RedisPort
-      CacheSubnetGroupName: !Ref AgentRedisSubnetGroup
-      SecurityGroupIds:
-        - !Ref AgentRedisSecurityGroup
-      TransitEncryptionEnabled: !If [UseTLS, true, false]
-      AuthToken: !If [UseAuthToken, !Ref RedisAuthToken, !Ref "AWS::NoValue"]
-
-Outputs:
-
-  RedisPrimaryEndpoint:
-    Description: "Redis primary endpoint address"
-    Value: !GetAtt AgentRedisReplicationGroup.PrimaryEndPoint.Address
-    Export:
-      Name: !Sub "${AWS::StackName}-RedisPrimaryEndpoint"
-
-  RedisPort:
-    Description: "Redis port"
-    Value: !Ref RedisPort
-    Export:
-      Name: !Sub "${AWS::StackName}-RedisPort"
-
-  RedisTLS:
-    Description: "Whether TLS is enabled"
-    Value: !If [UseTLS, "true", "false"]
-    Export:
-      Name: !Sub "${AWS::StackName}-RedisTLS"
-
-  AgentLambdaSecurityGroupId:
-    Description: "Security group ID to attach to the Lambda function"
-    Value: !Ref AgentLambdaSecurityGroup
-    Export:
-      Name: !Sub "${AWS::StackName}-LambdaSecurityGroupId"
-iam
-AWSTemplateFormatVersion: "2010-09-09"
-Description: "AgentCore IAM - Lambda Execution Role"
-
-Parameters:
-
-  KinesisStreamArn:
-    Type: String
-    Default: arn:aws:kinesis:us-east-1:611184449569:stream/complaintsinteraction-stream
-
-  AgentRuntimeId:
-    Type: String
-    Default: ail_orchestrator_runtime_stable-JhF5vuHmgW
-
-  AILOrchestratorInvokeLogGroup:
-    Type: String
-    Default: /aws/bedrock-agentcore/runtimes/ail_orchestrator_runtime_stable-JhF5vuHmgW-DEFAULT
-
-Resources:
-
-  AgentLambdaExecutionRole:
-    Type: AWS::IAM::Role
-    Properties:
-      RoleName: "colleague-assist-orchestrator-interaction-stream-iam-dev"
-      PermissionsBoundary: arn:aws:iam::611184449569:policy/core-ServiceRolePermissionsBoundary
-      AssumeRolePolicyDocument:
-        Version: "2012-10-17"
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: lambda.amazonaws.com
-            Action: sts:AssumeRole
-      ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
-        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
-
-      Policies:
-        - PolicyName: KinesisReadAccess
-          PolicyDocument:
-            Version: "2012-10-17"
-            Statement:
-              - Effect: Allow
-                Action:
-                  - kinesis:GetRecords
-                  - kinesis:GetShardIterator
-                  - kinesis:DescribeStream
-                  - kinesis:DescribeStreamSummary
-                  - kinesis:ListShards
-                  - kinesis:ListStreams
-                Resource: !Ref KinesisStreamArn
-              - Effect: Allow
-                Action:
-                  - kinesis:ListStreams
-                Resource: "*"
-
-        - PolicyName: InvokeAgentCoreRuntime
-          PolicyDocument:
-            Version: "2012-10-17"
-            Statement:
-              - Sid: WriteLogs
-                Effect: Allow
-                Action:
-                  - logs:CreateLogStream
-                  - logs:PutLogEvents
-                Resource:
-                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${AILOrchestratorInvokeLogGroup}"
-                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${AILOrchestratorInvokeLogGroup}:*"
-
-              - Sid: VpcEni
-                Effect: Allow
-                Action:
-                  - ec2:CreateNetworkInterface
-                  - ec2:DescribeNetworkInterfaces
-                  - ec2:DeleteNetworkInterface
-                  - ec2:DescribeSubnets
-                  - ec2:DescribeSecurityGroups
-                  - ec2:DescribeVpcs
-                Resource: "*"
-
-              - Sid: InvokeAgentRuntime
-                Effect: Allow
-                Action:
-                  - bedrock-agentcore:InvokeAgentRuntime
-                Resource:
-                  - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:runtime/${AgentRuntimeId}"
-                  - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:runtime/${AgentRuntimeId}/runtime-endpoint/DEFAULT"
-
-              - Sid: StopAgentCoreSession
-                Effect: Allow
-                Action:
-                  - bedrock-agentcore:StopRuntimeSession
-                Resource:
-                  - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:runtime/${AgentRuntimeId}"
-                  - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:runtime/${AgentRuntimeId}/runtime-endpoint/DEFAULT"
-
-        - PolicyName: BedrockInvokePolicy
-          PolicyDocument:
-            Version: "2012-10-17"
-            Statement:
-              - Sid: BedrockInvoke
-                Effect: Allow
-                Action:
-                  - bedrock:InvokeModel
-                  - bedrock:InvokeModelWithResponseStream
-                  - bedrock:Converse
-                  - bedrock:ConverseStream
-                Resource: "*"
-
-        - PolicyName: S3ReadPolicy
-          PolicyDocument:
-            Version: "2012-10-17"
-            Statement:
-              - Sid: S3ReadAccess
-                Effect: Allow
-                Action:
-                  - s3:GetObject
-                Resource: "*"
-
-        - PolicyName: SSMReadPolicy
-          PolicyDocument:
-            Version: "2012-10-17"
-            Statement:
-              - Sid: SSMParameterRead
-                Effect: Allow
-                Action:
-                  - ssm:GetParameter
-                  - ssm:GetParameters
-                  - ssm:GetParametersByPath
-                Resource:
-                  - !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/agentcore/*"
-
-Outputs:
-
-  LambdaExecutionRoleArn:
-    Description: "ARN of the Lambda execution role"
-    Value: !GetAtt AgentLambdaExecutionRole.Arn
-    Export:
-      Name: !Sub "${AWS::StackName}-LambdaExecutionRoleArn"
-
-  LambdaExecutionRoleName:
-    Description: "Name of the Lambda execution role"
-    Value: !Ref AgentLambdaExecutionRole
-    Export:
-      Name: !Sub "${AWS::StackName}-LambdaExecutionRoleName"
-
-
-lambda
-
 AWSTemplateFormatVersion: "2010-09-09"
 Description: "AgentCore Lambda - Interaction Stream Processor (imports Redis + IAM stacks)"
 
@@ -294,9 +24,16 @@ Parameters:
     NoEcho: true
     Default: ""
 
-  RedisLayerArn:
+  # ── Redis Layer (created from S3 zip) ───────────────────────────────────────
+  RedisLayerS3Bucket:
     Type: String
-    Default: arn:aws:lambda:us-east-1:611184449569:layer:redislayer:1
+    Default: kplrwl-s3-bucket-611184449569
+    Description: "S3 bucket where the Redis layer zip is uploaded"
+
+  RedisLayerS3Key:
+    Type: String
+    Default: LambdaLayers/redislayer.zip
+    Description: "S3 key (path) to the Redis layer zip file"
 
   # ── Kinesis ─────────────────────────────────────────────────────────────────
   KinesisStreamArn:
@@ -345,6 +82,19 @@ Conditions:
 
 Resources:
 
+  # ── Redis Lambda Layer (published from S3 zip) ──────────────────────────────
+  RedisLambdaLayer:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      LayerName: "colleague-assist-orchestrator-redis-layer-dev"
+      Description: "Redis client layer for Python 3.12"
+      Content:
+        S3Bucket: !Ref RedisLayerS3Bucket
+        S3Key: !Ref RedisLayerS3Key
+      CompatibleRuntimes:
+        - python3.12
+
+  # ── Lambda Function ─────────────────────────────────────────────────────────
   AgentRedisHealthCheckFunction:
     Type: AWS::Lambda::Function
     Properties:
@@ -356,7 +106,7 @@ Resources:
       Timeout: 60
       MemorySize: 256
       Layers:
-        - !Ref RedisLayerArn
+        - !Ref RedisLambdaLayer        # ← references the layer created above
       VpcConfig:
         SubnetIds: !Ref PrivateSubnetIds
         SecurityGroupIds:
@@ -388,6 +138,7 @@ Resources:
         S3Bucket: kplrwl-s3-bucket-611184449569
         S3Key: LambdaFunctions/InteractionStream.zip
 
+  # ── Kinesis Event Source Mapping ────────────────────────────────────────────
   AgentKinesisEventMapping:
     Type: AWS::Lambda::EventSourceMapping
     Properties:
@@ -404,6 +155,12 @@ Resources:
 
 Outputs:
 
+  RedisLayerArn:
+    Description: "ARN of the Redis Lambda layer version"
+    Value: !Ref RedisLambdaLayer
+    Export:
+      Name: !Sub "${AWS::StackName}-RedisLayerArn"
+
   LambdaFunctionName:
     Value: !Ref AgentRedisHealthCheckFunction
     Export:
@@ -413,4 +170,3 @@ Outputs:
     Value: !GetAtt AgentRedisHealthCheckFunction.Arn
     Export:
       Name: !Sub "${AWS::StackName}-LambdaFunctionArn"
-
