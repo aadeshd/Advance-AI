@@ -1,4 +1,3 @@
-import base64
 import json
 import logging
 import os
@@ -7,6 +6,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import boto3
+from botocore.config import Config
 import redis
 
 # --------------------------------------------------------------------------------------
@@ -27,6 +27,12 @@ CHANNEL_TYPE = os.environ.get("CHANNEL_TYPE", "PHONE")
 CONFIG_S3_BUCKET = os.environ.get("CONFIG_S3_BUCKET")
 STATE_SCHEMA_S3_KEY = os.environ.get("STATE_SCHEMA_S3_KEY", "config/state_schema.json")
 RULES_S3_KEY = os.environ.get("RULES_S3_KEY", "config/orchestrator_rules.json")
+
+# FIX 3: Account ID for ExpectedBucketOwner on all S3 calls
+AWS_ACCOUNT_ID = os.environ["AWS_ACCOUNT_ID"]
+
+# FIX 2: Explicit timeouts for all S3 network calls — prevents hanging Lambda executions
+S3_CLIENT_CONFIG = Config(connect_timeout=5, read_timeout=10)
 
 logger = logging.getLogger(__name__)
 logger.setLevel(LOG_LEVEL)
@@ -50,9 +56,6 @@ PHASE_EVENT_MAP = {
     "GENERATE_SUMMARY": "GENERATE_SUMMARY",
 }
 
-# CHANGE 1: Payload overrides for specific rule triggers.
-# When a rule named "compaction_trigger" fires, we want a different
-# event_category and event_action sent to the orchestrator.
 RULE_PAYLOAD_OVERRIDES: Dict[str, Dict[str, str]] = {
     "compaction_trigger": {
         "event_category": "COMPACTION",
@@ -75,7 +78,8 @@ redis_client = redis.Redis(
     decode_responses=True,
 )
 
-s3_client = boto3.client("s3")
+# FIX 2: S3 client uses explicit timeout config
+s3_client = boto3.client("s3", config=S3_CLIENT_CONFIG)
 
 _agentcore_endpoint = os.environ.get("AGENTCORE_ENDPOINT")
 agent_client = boto3.client(
@@ -86,6 +90,7 @@ agent_client = boto3.client(
 
 logger.info(f"Agent client created {agent_client}")
 
+
 # --------------------------------------------------------------------------------------
 # S3 config — cached at module level, loaded once per cold start
 # --------------------------------------------------------------------------------------
@@ -94,11 +99,6 @@ _state_schema_cache: Optional[Dict] = None
 _rules_cache: Optional[List] = None
 
 
-# CHANGE 2: load_state_schema now raises instead of returning None.
-# Previously it returned None on any failure and callers fell back to
-# hardcoded defaults silently. Now missing bucket config or a missing
-# S3 object raises immediately so the problem surfaces in CloudWatch
-# rather than being hidden by silent fallback behaviour.
 def load_state_schema() -> Dict:
     global _state_schema_cache
     if _state_schema_cache is not None:
@@ -110,7 +110,12 @@ def load_state_schema() -> Dict:
         )
 
     try:
-        response = s3_client.get_object(Bucket=CONFIG_S3_BUCKET, Key=STATE_SCHEMA_S3_KEY)
+        # FIX 3a: ExpectedBucketOwner added — first S3 get_object call
+        response = s3_client.get_object(
+            Bucket=CONFIG_S3_BUCKET,
+            Key=STATE_SCHEMA_S3_KEY,
+            ExpectedBucketOwner=AWS_ACCOUNT_ID,
+        )
         _state_schema_cache = json.loads(response["Body"].read().decode("utf-8"))
         logger.info(
             "State schema loaded | bucket=%s | key=%s",
@@ -126,9 +131,7 @@ def load_state_schema() -> Dict:
     except EnvironmentError:
         raise
     except Exception as exc:
-        raise RuntimeError(
-            f"Failed to load state schema from S3: {exc}"
-        ) from exc
+        raise RuntimeError(f"Failed to load state schema from S3: {exc}") from exc
 
 
 def load_orchestrator_rules() -> Optional[List]:
@@ -139,7 +142,12 @@ def load_orchestrator_rules() -> Optional[List]:
         logger.warning("CONFIG_S3_BUCKET not set — fallback: matched_categories only")
         return None
     try:
-        response = s3_client.get_object(Bucket=CONFIG_S3_BUCKET, Key=RULES_S3_KEY)
+        # FIX 3b: ExpectedBucketOwner added — second S3 get_object call
+        response = s3_client.get_object(
+            Bucket=CONFIG_S3_BUCKET,
+            Key=RULES_S3_KEY,
+            ExpectedBucketOwner=AWS_ACCOUNT_ID,
+        )
         _rules_cache = json.loads(response["Body"].read().decode("utf-8"))
         logger.info(
             "Orchestrator rules loaded | bucket=%s | key=%s | count=%s",
@@ -249,13 +257,7 @@ def merge_with_schema(session: Dict, schema: Dict) -> Dict:
 
 
 def create_new_session(contact_id: str, now: str) -> Dict:
-    # CHANGE 3: load_state_schema() now raises — no None check needed.
-    # If the schema cannot be loaded, the exception propagates up and
-    # Lambda returns a 500, which Kinesis will retry. This is safer
-    # than silently creating sessions with hardcoded defaults that may
-    # be missing fields the orchestrator depends on.
     schema = load_state_schema()
-
     session = {**schema}
     session.update({
         "session_id": contact_id,
@@ -269,7 +271,6 @@ def create_new_session(contact_id: str, now: str) -> Dict:
     qc.setdefault("utterances", [])
     qc.setdefault("utterance_count", 0)
     qc.setdefault("channel_type", CHANNEL_TYPE)
-
     logger.info("Session created from S3 schema | contact_id=%s", contact_id)
     return session
 
@@ -279,9 +280,8 @@ def load_session(session_key: str, contact_id: str, now: str) -> Tuple[Dict, boo
     if not raw:
         logger.warning("No session found, creating new | contact_id=%s", contact_id)
         return create_new_session(contact_id, now), False
-
     session = json.loads(raw)
-    schema = load_state_schema()  # raises if unavailable
+    schema = load_state_schema()
     session = merge_with_schema(session, schema)
     return session, True
 
@@ -298,22 +298,14 @@ def safe_json_dumps(obj: Any) -> str:
     return json.dumps(obj, default=str)
 
 
-def decode_kinesis_data(kinesis_data_b64: str) -> Dict:
-    """
-    Handles both base64-encoded and raw JSON Kinesis payloads.
-    Tries base64 first (legacy), then falls back to raw JSON.
-    """
+# FIX 1: decode_kinesis_data — base64 path removed entirely.
+# Kinesis records are now always raw JSON strings from the sender lambda.
+def decode_kinesis_data(kinesis_data: str) -> Dict:
     try:
-        raw = base64.b64decode(kinesis_data_b64).decode("utf-8", errors="replace")
-        return json.loads(raw)
-    except Exception:
-        pass
-
-    try:
-        return json.loads(kinesis_data_b64)
+        return json.loads(kinesis_data)
     except json.JSONDecodeError as exc:
         raise ValueError(
-            f"Kinesis data is neither valid base64+JSON nor raw JSON: {kinesis_data_b64[:80]}"
+            f"Kinesis data is not valid JSON: {kinesis_data[:80]}"
         ) from exc
 
 
@@ -330,10 +322,8 @@ def extract_utterances_from_segments(segments: List[Dict]) -> Tuple[List[Dict], 
     for seg in segments or []:
         if not isinstance(seg, dict):
             continue
-
         if "Categories" in seg and isinstance(seg["Categories"], dict):
             matched_categories = seg["Categories"].get("MatchedCategories", []) or []
-
         transcript = seg.get("Transcript")
         if isinstance(transcript, dict):
             content = transcript.get("Content", "") or ""
@@ -353,6 +343,47 @@ def extract_utterances_from_segments(segments: List[Dict]) -> Tuple[List[Dict], 
 # Lambda entry
 # --------------------------------------------------------------------------------------
 
+# FIX 4: Extracted from lambda_handler to reduce its Cognitive Complexity.
+# Decodes and parses one Kinesis record into structured fields.
+# Raises on bad data so the caller can append to batch_failures cleanly.
+def _decode_record(record: Dict) -> Tuple[str, str, List[Dict], List[str]]:
+    payload = decode_kinesis_data(record["kinesis"]["data"])
+    event_type = normalise_event_type(payload.get("EventType"))
+    contact_id = payload.get("ContactId") or payload.get("contactId")
+
+    if not contact_id:
+        raise ValueError(f"No contact_id | keys={list(payload.keys())}")
+
+    utterances: List[Dict] = []
+    matched_categories: List[str] = []
+
+    if event_type == "SEGMENTS":
+        segments = payload.get("Segments") or payload.get("segments") or []
+        utterances, matched_categories = extract_utterances_from_segments(segments)
+
+    return contact_id, event_type, utterances, matched_categories
+
+
+# FIX 5: Extracted from lambda_handler to reduce its Cognitive Complexity.
+# Merges a decoded record into the per-contact accumulator dict.
+def _merge_into_contacts(
+    contacts: Dict,
+    contact_id: str,
+    event_type: str,
+    utterances: List[Dict],
+    matched_categories: List[str],
+) -> None:
+    if contact_id not in contacts:
+        contacts[contact_id] = {
+            "utterances": [],
+            "matched_categories": [],
+            "event_type": event_type,
+        }
+    contacts[contact_id]["utterances"].extend(utterances)
+    if matched_categories:
+        contacts[contact_id]["matched_categories"] = matched_categories
+
+
 def lambda_handler(event: Dict, context):
     request_id = getattr(context, "aws_request_id", "") if context else ""
 
@@ -366,40 +397,16 @@ def lambda_handler(event: Dict, context):
 
     records = event.get("Records", [])
     batch_failures = []
-    logger.info("Kinesis batch started | records=%s | request_id=%s", len(records), request_id)
-
     contacts: Dict[str, Dict] = {}
 
-    for i, record in enumerate(records):
+    logger.info("Kinesis batch started | records=%s | request_id=%s", len(records), request_id)
+
+    for record in records:
         seq = record.get("kinesis", {}).get("sequenceNumber", "")
         try:
-            payload = decode_kinesis_data(record["kinesis"]["data"])
-            event_type = normalise_event_type(payload.get("EventType"))
-            contact_id = payload.get("ContactId") or payload.get("contactId")
-
-            if not contact_id:
-                logger.warning("No contact_id | seq=%s | keys=%s", seq, list(payload.keys()))
-                continue
-
-            if contact_id not in contacts:
-                contacts[contact_id] = {
-                    "utterances": [],
-                    "matched_categories": [],
-                    "event_type": event_type,
-                }
-
-            if event_type == "SEGMENTS":
-                segments = payload.get("Segments") or payload.get("segments") or []
-                utterances, matched_categories = extract_utterances_from_segments(segments)
-                contacts[contact_id]["utterances"].extend(utterances)
-                if matched_categories:
-                    contacts[contact_id]["matched_categories"] = matched_categories
-
-            logger.info(
-                "Record decoded | seq=%s | eventType=%s | contactId=%s",
-                seq, event_type, contact_id,
-            )
-
+            contact_id, event_type, utterances, matched_categories = _decode_record(record)
+            _merge_into_contacts(contacts, contact_id, event_type, utterances, matched_categories)
+            logger.info("Record decoded | seq=%s | eventType=%s | contactId=%s", seq, event_type, contact_id)
         except Exception:
             logger.exception("Record decode failed | seq=%s | request_id=%s", seq, request_id)
             if seq:
@@ -436,10 +443,8 @@ def process_event(event: Dict, request_id: str = "") -> Dict:
     contact_id = event.get("ContactId")
     if not contact_id:
         raise KeyError("Missing required field: ContactId")
-
     segments = event.get("Segments") or []
     utterances, matched_categories = extract_utterances_from_segments(segments)
-
     return process_contact(
         contact_id=contact_id,
         event_type=event_type,
@@ -471,7 +476,7 @@ def process_contact(
         return {"contact_id": contact_id, "event_type": event_type}
 
     if event_type == "CONTACT_DISCONNECTED":
-        session, is_existing = load_session(session_key, contact_id, now)
+        session, _ = load_session(session_key, contact_id, now)
         session["contact_ended_at"] = now
         session["updated_at"] = now
         redis_set(session_key, safe_json_dumps(session))
@@ -518,8 +523,6 @@ def process_contact(
             "Orchestrator triggered | contact_id=%s | reason=%s | utterance_count=%s",
             contact_id, reason, curr_count,
         )
-        # CHANGE 4: Pass the triggering rule name so the orchestrator
-        # can send the correct event_category / event_action.
         invoke_ai_orchestrator(session, contact_id, reason=reason)
 
     return {
@@ -536,10 +539,6 @@ def process_contact(
 # Orchestrator
 # --------------------------------------------------------------------------------------
 
-# CHANGE 5: invoke_ai_orchestrator now accepts reason= and looks it up
-# in RULE_PAYLOAD_OVERRIDES to swap event_category / event_action.
-# For "compaction_trigger" this sends COMPACTION / COMPACT_SESSION.
-# All other rules continue to use the phase-derived defaults.
 def invoke_ai_orchestrator(session: Dict, contact_id: str, reason: str = "") -> None:
     runtime_arn = os.environ.get("AGENTCORE_RUNTIME_ARN") or os.environ.get("AGENT_RUNTIME_ARN")
     if not runtime_arn:
@@ -553,7 +552,6 @@ def invoke_ai_orchestrator(session: Dict, contact_id: str, reason: str = "") -> 
         phase = session.get("current_phase", "CONTACT_OPEN")
         default_event_action = PHASE_EVENT_MAP.get(phase, "CONTACT_INITIATED")
 
-        # Look up overrides for this specific rule trigger
         overrides = RULE_PAYLOAD_OVERRIDES.get(reason, {})
         event_category = overrides.get("event_category", "LIFECYCLE")
         event_action = overrides.get("event_action", default_event_action)
@@ -599,76 +597,3 @@ def invoke_ai_orchestrator(session: Dict, contact_id: str, reason: str = "") -> 
 
     except Exception:
         logger.exception("AgentCore invoke failed | contact_id=%s", contact_id)
-
-
-
-
-#######
-
-import json
-import logging
-
-logger = logging.getLogger()
-logger.setLevel(logging.INFO)
-
-AVG_MS_PER_WORD = {
-    "AGENT": 280,
-    "CUSTOMER": 320,
-    "DEFAULT": 300
-}
-
-def lambda_handler(event, context):
-    try:
-        if not isinstance(event, dict):
-            raise ValueError("Invalid input: event must be a dictionary")
-
-        eventtype = event.get("EventType", "").lower()
-
-        if eventtype != "segments":
-            # CHANGE: was base64.b64encode(...) — now raw JSON to match
-            # the segments branch. The receiver handles raw JSON fine, and
-            # mixing encodings per event type was the source of the error.
-            kinesis_data = json.dumps(event, ensure_ascii=False)
-            return {
-                **event,
-                "delay_seconds": 0,
-                "kinesis_data": kinesis_data
-            }
-
-        segment = event.get("Segments", [])
-        utterance = segment[0].get("Transcript", {})
-        content = utterance.get("Content") or ""
-
-        participant = str(utterance.get("ParticipantId", "DEFAULT")).upper()
-
-        word_count = len(content.split())
-        ms_per_word = AVG_MS_PER_WORD.get(participant, AVG_MS_PER_WORD["DEFAULT"])
-        word_based_ms = word_count * ms_per_word
-
-        begin = utterance.get("beginoffsetmillis")
-        end = utterance.get("endoffsetmillis")
-
-        if isinstance(begin, (int, float)) and isinstance(end, (int, float)) and end > begin:
-            actual_ms = end - begin
-        else:
-            actual_ms = word_based_ms
-
-        final_ms = min(word_based_ms, actual_ms)
-        delay_seconds = max(1, int(final_ms / 1000))
-
-        # Raw JSON — consistent with the non-segments branch above
-        kinesis_data = json.dumps(event, ensure_ascii=False)
-
-        return {
-            **event,
-            "delay_seconds": delay_seconds,
-            "kinesis_data": kinesis_data
-        }
-
-    except Exception as e:
-        logger.exception("Error occurred")
-        return {
-            "error": str(e),
-            "original_event": event
-        }
-
