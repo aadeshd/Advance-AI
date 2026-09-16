@@ -1,0 +1,2552 @@
+# Deploy commands: see deployments/DEPLOYMENT-HISTORY.md
+# Template standards: see deployments/TEMPLATE-STANDARDS.md
+#
+# =============================================================================
+# DEPLOYMENT — two passes against the SAME stack
+# =============================================================================
+# This template is ~95 KB. CloudFormation only accepts 51,200 bytes inline, so
+# it MUST be staged through S3. Plain `aws cloudformation deploy --template-file`
+# sends the body inline and fails with "template body is too large"; it also
+# cannot resolve the Lambda CodeUri local path. Use `sam deploy`, which uploads
+# both the template and the packaged code.
+#
+# Shared parameter block (adjust per environment):
+#
+#   PARAMS="AppName=ail-assist Environment=sit \
+#     PermissionsBoundaryArn=arn:aws:iam::<acct>:policy/core-ServiceRolePermissionsBoundary \
+#     VpcIdValue=/app/network/VPCId VpcIdPath=/app/network/VPCId \
+#     VpcCidrValue=/app/network/VPCCidr \
+#     LambdaSubnet1=/ail/network/vpce/subneta LambdaSubnet2=/ail/network/vpce/subnetb \
+#     ElastiCacheSubnet1=/ail/network/vpce/subneta ElastiCacheSubnet2=/ail/network/vpce/subnetb \
+#     RedisProductId=prod-xxxx RedisProvisioningArtifactId=pa-xxxx \
+#     RedisVarName=/ail/sit/network/redis/config \
+#     AgentCoreVarName=/ail/sit/network/agentcore/config"
+#
+# PASS 1 — create the artifacts bucket + KMS key only:
+#   sam deploy --stack-name ail-assist-sit --template-file template.yaml \
+#     --resolve-s3 --parameter-overrides $PARAMS DeploymentMode=BucketOnly \
+#     --capabilities CAPABILITY_NAMED_IAM --region eu-central-1 --profile sitprofile
+#
+# PASS 2 — same stack, now create every application service:
+#   sam build
+#   sam deploy --stack-name ail-assist-sit --template-file template.yaml \
+#     --s3-bucket ail-assist-artifacts-sit-<acct> --s3-prefix lambda/interaction-stream \
+#     --parameter-overrides $PARAMS DeploymentMode=FullCreateBucket \
+#     --capabilities CAPABILITY_NAMED_IAM --region eu-central-1 --profile sitprofile
+#
+# NOTE: KinesisStreamArn appeared in the old commands but is not a parameter of
+# this template — passing it now fails validation. The Lambda is fed by SQS.
+# NOTE: LambdaS3BucketName / LambdaCodeKeyName are intentionally retained but
+# unreferenced; they exist only for the manual/console deployment path where the
+# commented-out CodeUri block under InteractionStreamLambda is swapped back in.
+# =============================================================================
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: "AWS::Serverless-2016-10-31"
+Description: >-
+  Colleague Assist backend infrastructure plus the static S3 artifacts bucket and its KMS key.
+
+  DeploymentMode controls bootstrap behaviour: BucketOnly creates only the artifacts bucket/KMS key;
+  FullCreateBucket creates the bucket/KMS key plus all application services.
+  Deploy BucketOnly first, upload the Lambda artifact, then redeploy the same stack as FullCreateBucket.
+
+Parameters:
+  # ---------------------------------------------------------------------------
+  # Core identifiers (REQUIRED — no defaults, differ per environment/account)
+  # ---------------------------------------------------------------------------
+  DeploymentMode:
+    Type: String
+    Default: BucketOnly
+    AllowedValues:
+    - BucketOnly
+    - FullCreateBucket
+    Description: >-
+      BucketOnly = create only the static artifacts bucket and its KMS key (bootstrap pass).
+      FullCreateBucket = keep that bucket/KMS key and additionally create all application services.
+  AppName:
+    Type: String
+    Default: ail-assist
+    Description: Application name used as naming prefix.
+
+  Environment:
+    Type: String
+    AllowedValues:
+    - dev
+    - sit
+    - uat
+    - prod
+    - tmp
+    Description: Deployment environment.
+
+  PermissionsBoundaryArn:
+    Type: String
+    Default: ""
+    Description: Permissions boundary ARN required by organisation governance.
+
+  # ---------------------------------------------------------------------------
+  # Network (REQUIRED — differ per account/environment)
+  # ---------------------------------------------------------------------------
+  VpcIdValue:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::VPC::Id>
+    Default: /app/network/VPCId
+    Description: SSM path that resolves to VPC ID for security groups.
+
+  VpcIdPath:
+    Type: String
+    Default: /app/network/VPCId
+    Description: SSM path for VPC ID (passed as-is to Service Catalog Redis product).
+
+  VpcCidrValue:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /app/network/VPCCidr
+    Description: SSM path that resolves to VPC CIDR for security group egress rules.
+
+  LambdaSubnet1:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Subnet::Id>
+    Description: SSM path that resolves to Lambda subnet 1.
+
+  LambdaSubnet2:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Subnet::Id>
+    Description: SSM path that resolves to Lambda subnet 2.
+
+  ElastiCacheSubnet1:
+    Type: String
+    Description: SSM parameter path for Redis subnet 1 (passed as-is to Service Catalog product).
+
+  ElastiCacheSubnet2:
+    Type: String
+    Description: SSM parameter path for Redis subnet 2 (passed as-is to Service Catalog product).
+
+  # ---------------------------------------------------------------------------
+  # Redis (REQUIRED — Service Catalog IDs differ per account)
+  # ---------------------------------------------------------------------------
+  RedisProductId:
+    Type: String
+    Description: Service Catalog product ID for ElastiCache Redis.
+
+  RedisProvisioningArtifactId:
+    Type: String
+    Description: Service Catalog provisioning artifact ID for Redis.
+
+  # Redis config (safe defaults — same across environments)
+  RedisPort:
+    Type: Number
+    Default: 6379
+
+  RedisCacheNodeType:
+    Type: String
+    Default: cache.t3.small
+
+  RedisEngineVersion:
+    Type: String
+    Default: "7.0"
+
+  RedisNumNodeGroups:
+    Type: Number
+    Default: 1
+
+  RedisReplicasPerNodeGroup:
+    Type: Number
+    Default: 0
+
+  RedisMultiAZEnabled:
+    Type: String
+    AllowedValues:
+    - "true"
+    - "false"
+    Default: "false"
+
+  RedisSnapshotRetentionLimit:
+    Type: Number
+    Default: 5
+
+  RedisLogFormat:
+    Type: String
+    Default: json
+
+  RedisLogType:
+    Type: String
+    Default: slow-log
+
+  RedisLogRetentionDays:
+    Type: Number
+    Default: 90
+
+  RedisCacheLogsEnabled:
+    Type: String
+    AllowedValues:
+    - "true"
+    - "false"
+    Default: "false"
+
+  # ---------------------------------------------------------------------------
+  # Lambda (REQUIRED — S3 bucket differs per account)
+  # ---------------------------------------------------------------------------
+  LambdaS3BucketName:
+    Type: String
+    Description: S3 bucket holding Lambda deployment zip.
+    Default: ""
+
+  LambdaCodeKeyName:
+    Type: String
+    Default: ""
+    Description: S3 key for Lambda code zip.
+
+  # Lambda config (safe defaults — same across environments)
+  LambdaHandler:
+    Type: String
+    Default: ail_connect_adapter.handler.lambda_handler
+
+  LambdaRuntime:
+    Type: String
+    Default: python3.12
+
+  LambdaTimeout:
+    Type: Number
+    Default: 60
+
+  LambdaArchitecture:
+    Type: String
+    Default: x86_64
+
+  LambdaMemorySize:
+    Type: Number
+    Default: 512
+
+  LambdaTracing:
+    Type: String
+    Default: Active
+
+  LambdaDescription:
+    Type: String
+    Default: AIL Colleague Assist interaction stream lambda
+
+  LogRetentionInDays:
+    Type: Number
+    Default: 30
+    AllowedValues:
+    - 7
+    - 14
+    - 30
+    - 90
+    - 365
+    Description: "CloudWatch log retention. dev/sit: 30 | uat: 90 | prod: 365"
+
+  # ---------------------------------------------------------------------------
+  # Lambda environment variable defaults (same across environments)
+  # ---------------------------------------------------------------------------
+  ConnectTimeoutSeconds:
+    Type: Number
+    Default: 2
+
+  SocketTimeoutSeconds:
+    Type: Number
+    Default: 2
+
+  SessionTtlSeconds:
+    Type: Number
+    Default: 3600
+
+  RedisVarName:
+    Type: String
+    Description: SSM parameter path for Redis connection config JSON. MUST include environment (e.g., /ail/sit/network/redis/config).
+
+  AgentCoreVarName:
+    Type: String
+    Description: SSM parameter path for AgentCore connection config JSON. MUST include environment (e.g., /ail/sit/network/agentcore/config).
+
+  # ---------------------------------------------------------------------------
+  # Monitoring (OPTIONAL — AgentCore log group for app-level metric filters)
+  # ---------------------------------------------------------------------------
+  AgentCoreLogGroupName:
+    Type: String
+    Default: ""
+    Description: >-
+      AgentCore CloudWatch log group name (auto-created by Bedrock runtime).
+      e.g. /aws/bedrock-agentcore/runtime/colleague_assist_orchestrator_dev-JgFPRbFKM0
+      Leave empty to skip AgentCore metric filters and alarms.
+
+  # ---------------------------------------------------------------------------
+  # SQS FIFO queue — cross-account forwarder (optional)
+  # ---------------------------------------------------------------------------
+  SourceAccountForwarderRoleArn:
+    Type: String
+    Default: ""
+    Description: "ARN of the cross-account forwarder Lambda execution role. Leave empty if no cross-account access needed."
+
+
+  KMSRoleName:
+    Type: String
+    Description: IAM role that will be used as a principal for the KMS key
+    Default: core-CloudformationStackAdmin
+
+  TransitionToIADays:
+    Type: Number
+    Description: Days before transitioning object versions to STANDARD_IA
+    Default: 30
+    MinValue: 0
+    MaxValue: 365
+
+  TransitionToGlacierDays:
+    Type: Number
+    Description: Days before transitioning object versions to GLACIER
+    Default: 365
+    MinValue: 1
+    MaxValue: 3650
+
+  ExpirationDays:
+    Type: Number
+    Description: Days before deleting old object versions
+    Default: 2555
+    MinValue: 1
+    MaxValue: 10950
+
+Conditions:
+  HasPermissionsBoundary: !Not [!Equals [!Ref PermissionsBoundaryArn, ""]]
+  HasAgentCoreLogGroup: !Not [!Equals [!Ref AgentCoreLogGroupName, ""]]
+  HasCrossAccountForwarder: !Not [!Equals [!Ref SourceAccountForwarderRoleArn, ""]]
+  # Both modes create the artifacts bucket/KMS key, so no condition guards them.
+  # Only the application services are gated.
+  DeployApplicationServices: !Not [!Equals [!Ref DeploymentMode, BucketOnly]]
+  DeployApplicationServicesAndHasAgentCoreLogGroup: !And [!Condition DeployApplicationServices, !Condition HasAgentCoreLogGroup]
+  DeployApplicationServicesAndHasCrossAccountForwarder: !And [!Condition DeployApplicationServices, !Condition HasCrossAccountForwarder]
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # Security groups created in this parent stack and stored in SSM
+  # ---------------------------------------------------------------------------
+  ArtifactsKmsKey:
+    Type: AWS::KMS::Key
+    # The bucket created below cannot be read without this key. Retain so an
+    # accidental stack delete never orphans the artifacts.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Description: !Sub "KMS key for ail-assist artifacts bucket in ${Environment}"
+      EnableKeyRotation: true
+      KeySpec: SYMMETRIC_DEFAULT
+      KeyUsage: ENCRYPT_DECRYPT
+      KeyPolicy:
+        Version: '2012-10-17'
+        Id: ail-assist-artifacts-s3
+        Statement:
+        - Sid: EnableIAMUserPermissions
+          Effect: Allow
+          Principal:
+            AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+          Action: "kms:*"
+          Resource: "*"
+
+        - Sid: AllowKmsAdministration
+          Effect: Allow
+          Principal:
+            AWS: !Sub "arn:aws:iam::${AWS::AccountId}:role/${KMSRoleName}"
+          Action:
+          - kms:Create*
+          - kms:Describe*
+          - kms:Enable*
+          - kms:List*
+          - kms:Put*
+          - kms:Update*
+          - kms:Revoke*
+          - kms:Disable*
+          - kms:Get*
+          - kms:Delete*
+          - kms:TagResource
+          - kms:UntagResource
+          - kms:ScheduleKeyDeletion
+          - kms:CancelKeyDeletion
+          Resource: "*"
+
+        - Sid: AllowArtifactsKeyUsage
+          Effect: Allow
+          Principal:
+            AWS: !Sub "arn:aws:iam::${AWS::AccountId}:role/${KMSRoleName}"
+          Action:
+          - kms:Encrypt
+          - kms:Decrypt
+          - kms:ReEncrypt*
+          - kms:GenerateDataKey*
+          - kms:DescribeKey
+          Resource: "*"
+
+        - Sid: AllowPersistentResourceGrants
+          Effect: Allow
+          Principal:
+            AWS: !Sub "arn:aws:iam::${AWS::AccountId}:role/${KMSRoleName}"
+          Action:
+          - kms:CreateGrant
+          - kms:ListGrants
+          - kms:RevokeGrant
+          Resource: "*"
+          Condition:
+            Bool:
+              kms:GrantIsForAWSResource: 'true'
+      Tags:
+      - Key: Application
+        Value: ail-assist
+      - Key: Environment
+        Value: !Ref Environment
+      - Key: Component
+        Value: KMS
+      - Key: Purpose
+        Value: S3-Artifacts-Encryption
+
+  ArtifactsKmsKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub "alias/ail-assist-artifacts-s3-${Environment}"
+      TargetKeyId: !Ref ArtifactsKmsKey
+
+  ArtifactsBucket:
+    Type: AWS::S3::Bucket
+    # Retain: CloudFormation cannot delete a non-empty versioned bucket, and the
+    # Lambda zip lives here. Delete manually if the stack is truly being retired.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub "ail-assist-artifacts-${Environment}-${AWS::AccountId}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+        - BucketKeyEnabled: true
+          ServerSideEncryptionByDefault:
+            SSEAlgorithm: aws:kms
+            KMSMasterKeyID: !GetAtt ArtifactsKmsKey.Arn
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+        - Id: TransitionOldVersionsToIA
+          Status: Enabled
+          NoncurrentVersionTransitions:
+          - StorageClass: STANDARD_IA
+            TransitionInDays: !Ref TransitionToIADays
+        - Id: TransitionOldVersionsToGlacier
+          Status: Enabled
+          NoncurrentVersionTransitions:
+          - StorageClass: GLACIER
+            TransitionInDays: !Ref TransitionToGlacierDays
+        - Id: DeleteExpiredVersions
+          Status: Enabled
+          NoncurrentVersionExpirationInDays: !Ref ExpirationDays
+      # PublicAccessBlockConfiguration is enforced at organisation level.
+      NotificationConfiguration:
+        EventBridgeConfiguration:
+          EventBridgeEnabled: true
+      Tags:
+      - Key: Project
+        Value: AIL-ColleagueAssist
+      - Key: Environment
+        Value: !Ref Environment
+      - Key: Purpose
+        Value: LambdaDeploymentArtifacts
+      - Key: DataClassification
+        Value: INTERNAL
+      - Key: Component
+        Value: Compute
+
+  RedisAdditionalSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: DeployApplicationServices
+    Properties:
+      GroupDescription: !Sub "${AppName}-${Environment}-redis-additional-sg"
+      VpcId: !Ref VpcIdValue
+      Tags:
+      - Key: Name
+        Value: !Sub "${AppName}-${Environment}-redis-additional-sg"
+      - Key: Application
+        Value: !Ref AppName
+      - Key: Environment
+        Value: !Ref Environment
+
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: DeployApplicationServices
+    Properties:
+      GroupDescription: !Sub "${AppName}-${Environment}-lambda-sg"
+      VpcId: !Ref VpcIdValue
+      SecurityGroupEgress:
+      - IpProtocol: tcp
+        FromPort: 443
+        ToPort: 443
+        CidrIp: !Ref VpcCidrValue
+        Description: HTTPS to VPC endpoints in Lambda subnets
+      - IpProtocol: tcp
+        FromPort: 443
+        ToPort: 443
+        CidrIp: 28.41.124.0/22
+        Description: HTTPS to VPC endpoints in 28.41.124.0/22
+      - IpProtocol: tcp
+        FromPort: 443
+        ToPort: 443
+        CidrIp: 28.41.128.0/22
+        Description: HTTPS to VPC endpoints in 28.41.128.0/22
+      - IpProtocol: tcp
+        FromPort: 443
+        ToPort: 443
+        CidrIp: 28.41.132.0/22
+        Description: HTTPS to VPC endpoints in 28.41.132.0/22
+      - IpProtocol: tcp
+        FromPort: !Ref RedisPort
+        ToPort: !Ref RedisPort
+        DestinationSecurityGroupId: !Ref RedisAdditionalSecurityGroup
+        Description: Redis access
+      Tags:
+      - Key: Name
+        Value: !Sub "${AppName}-${Environment}-lambda-sg"
+      - Key: Application
+        Value: !Ref AppName
+      - Key: Environment
+        Value: !Ref Environment
+
+  AgentCoreAdditionalSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: DeployApplicationServices
+    Properties:
+      GroupDescription: !Sub "${AppName}-${Environment}-agentcore-additional-sg"
+      VpcId: !Ref VpcIdValue
+      SecurityGroupEgress:
+      - IpProtocol: tcp
+        FromPort: !Ref RedisPort
+        ToPort: !Ref RedisPort
+        DestinationSecurityGroupId: !Ref RedisAdditionalSecurityGroup
+        Description: Allow AgentCore to access Redis
+      - IpProtocol: tcp
+        FromPort: 443
+        ToPort: 443
+        CidrIp: !Ref VpcCidrValue
+        Description: HTTPS to VPC endpoints in Lambda subnets
+      - IpProtocol: tcp
+        FromPort: 443
+        ToPort: 443
+        CidrIp: 28.41.124.0/22
+        Description: HTTPS to VPC endpoints in 28.41.124.0/22
+      - IpProtocol: tcp
+        FromPort: 443
+        ToPort: 443
+        CidrIp: 28.41.128.0/22
+        Description: HTTPS to VPC endpoints in 28.41.128.0/22
+      - IpProtocol: tcp
+        FromPort: 443
+        ToPort: 443
+        CidrIp: 28.41.132.0/22
+        Description: HTTPS to VPC endpoints in 28.41.132.0/22
+      Tags:
+      - Key: Name
+        Value: !Sub "${AppName}-${Environment}-agentcore-additional-sg"
+      - Key: Application
+        Value: !Ref AppName
+      - Key: Environment
+        Value: !Ref Environment
+
+  # ---------------------------------------------------------------------------
+  # AgentCore Runtime execution role
+  # ---------------------------------------------------------------------------
+  AgentCoreRuntimeExecutionRole:
+    Type: AWS::IAM::Role
+    Condition: DeployApplicationServices
+    Properties:
+      RoleName: !Sub "svc-${AppName}-${Environment}-agentcore-role"
+      PermissionsBoundary: !If [HasPermissionsBoundary, !Ref PermissionsBoundaryArn, !Ref "AWS::NoValue"]
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+        - Sid: AgentCoreAssumeRole
+          Effect: Allow
+          Principal:
+            Service: bedrock-agentcore.amazonaws.com
+          Action: sts:AssumeRole
+          # Confused-deputy guard: without these, any AgentCore runtime in any
+          # account could ask the service to assume this role.
+          Condition:
+            StringEquals:
+              aws:SourceAccount: !Ref "AWS::AccountId"
+            ArnLike:
+              aws:SourceArn: !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:*"
+      Policies:
+      - PolicyName: AgentCoreRuntimeExecutionPolicy
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+          - Sid: WriteLogs
+            Effect: Allow
+            Action:
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+            - logs:DescribeLogStreams
+            - logs:PutResourcePolicy
+            Resource:
+            - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/runtimes/*"
+            - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/runtimes/*:log-stream:*"
+          - Sid: DescribeLogGroups
+            Effect: Allow
+            # DescribeLogGroups cannot be scoped to a single group; it is a
+            # list-style call and must stay on log-group:*.
+            Action:
+            - logs:DescribeLogGroups
+            Resource:
+            - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:*"
+
+          # -----------------------------------------------------------------
+          # Container image pull. Without these the runtime cannot start at all:
+          # AgentCore pulls the agent image from ECR using this role.
+          # -----------------------------------------------------------------
+          - Sid: ECRImagePull
+            Effect: Allow
+            Action:
+            - ecr:BatchGetImage
+            - ecr:GetDownloadUrlForLayer
+            - ecr:BatchCheckLayerAvailability
+            Resource:
+            - !Sub "arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/*"
+          - Sid: ECRAuthToken
+            Effect: Allow
+            # GetAuthorizationToken is account-wide by design and cannot be scoped.
+            Action:
+            - ecr:GetAuthorizationToken
+            Resource: "*"
+
+          # -----------------------------------------------------------------
+          # Workload identity — AgentCore mints the agent's access token through
+          # these calls on every session.
+          # -----------------------------------------------------------------
+          - Sid: GetAgentAccessToken
+            Effect: Allow
+            Action:
+            - bedrock-agentcore:GetWorkloadAccessToken
+            - bedrock-agentcore:GetWorkloadAccessTokenForJWT
+            - bedrock-agentcore:GetWorkloadAccessTokenForUserId
+            Resource:
+            - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:workload-identity-directory/default"
+            - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:workload-identity-directory/default/workload-identity/*"
+
+          # -----------------------------------------------------------------
+          # Observability. Tracing and the built-in AgentCore metrics are both
+          # silent failures when missing — nothing errors, data just never lands.
+          # -----------------------------------------------------------------
+          - Sid: XRayTracing
+            Effect: Allow
+            Action:
+            - xray:PutTraceSegments
+            - xray:PutTelemetryRecords
+            - xray:GetSamplingRules
+            - xray:GetSamplingTargets
+            Resource: "*"
+          - Sid: PutAgentCoreMetrics
+            Effect: Allow
+            Action: cloudwatch:PutMetricData
+            Resource: "*"
+            Condition:
+              StringEquals:
+                cloudwatch:namespace: bedrock-agentcore
+
+          - Sid: InvokeAgentRuntime
+            Effect: Allow
+            Action:
+            - bedrock-agentcore:InvokeAgentRuntime
+            Resource:
+            - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:runtime/*"
+          - Sid: StopAgentCoreSession
+            Effect: Allow
+            Action:
+            - bedrock-agentcore:StopRuntimeSession
+            Resource:
+            - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:runtime/*"
+          - Sid: InvokeBedrockModels
+            Effect: Allow
+            Action:
+            - bedrock:InvokeModel
+            - bedrock:InvokeModelWithResponseStream
+            - bedrock:Converse
+            - bedrock:ConverseStream
+            Resource:
+            # The configured model IDs are EU cross-region inference profiles
+            # (eu.anthropic.claude-*). Such a profile routes the request to a
+            # foundation model in ANY of the profile's member regions, so the
+            # foundation-model ARN must not be pinned to ${AWS::Region} or the
+            # call fails with AccessDenied the moment it routes elsewhere.
+            - "arn:aws:bedrock:*::foundation-model/*"
+            - !Sub "arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/*"
+            - !Sub "arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:application-inference-profile/*"
+
+          # This stack creates a Guardrail and publishes its ID into SSM for the
+          # agent to use; without ApplyGuardrail the agent cannot actually use it.
+          - Sid: ApplyBedrockGuardrail
+            Effect: Allow
+            Action:
+            - bedrock:ApplyGuardrail
+            - bedrock:GetGuardrail
+            Resource:
+            - !Sub "arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:guardrail/*"
+          - Sid: SSMParameterRead
+            Effect: Allow
+            Action:
+            - ssm:GetParameter
+            - ssm:GetParameters
+            - ssm:GetParametersByPath
+            Resource:
+            # Every parameter this stack writes lives under /ail/<env>/. Scope to
+            # the environment so a dev runtime cannot read prod configuration.
+            - !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/ail/${Environment}/*"
+          - Sid: SecretsManagerAccess
+            Effect: Allow
+            Action:
+            - secretsmanager:GetSecretValue
+            Resource:
+                  # Scoped to Redis auth secret only (C1 fix — was secret:*)
+            - !GetAtt RedisProvisionedProduct.Outputs.CacheSecretArn
+          - Sid: KMSDecryptBedrockGuardrail
+            Effect: Allow
+            Action:
+            - kms:Decrypt
+            - kms:DescribeKey
+            Resource:
+                  # Scoped to Bedrock Guardrail KMS key only (C2 fix — was key/*)
+            - !GetAtt BedrockGuardrailKmsKey.Arn
+          - Sid: KMSDecryptViaSecretsManager
+            Effect: Allow
+            Action:
+            - kms:Decrypt
+            - kms:DescribeKey
+            Resource:
+                  # Allow decrypt for any key, but ONLY when accessed through
+                  # Secrets Manager (covers Redis secret's encryption key which
+                  # is created by the Service Catalog product — ARN not available here)
+            - !Sub "arn:aws:kms:${AWS::Region}:${AWS::AccountId}:key/*"
+            Condition:
+              StringEquals:
+                kms:ViaService: !Sub "secretsmanager.${AWS::Region}.amazonaws.com"
+      Tags:
+      - Key: Application
+        Value: !Ref AppName
+      - Key: Environment
+        Value: !Ref Environment
+
+  # ---------------------------------------------------------------------------
+  # KMS Key for Bedrock Guardrail encryption
+  # ---------------------------------------------------------------------------
+  BedrockGuardrailKmsKey:
+    Type: AWS::KMS::Key
+    Condition: DeployApplicationServices
+    Properties:
+      Description: !Sub "KMS key for Bedrock Guardrail encryption - ${AppName}-${Environment}"
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+        - Sid: Enable IAM User Permissions
+          Effect: Allow
+          Principal:
+            AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+          Action: "kms:*"
+          Resource: "*"
+        - Sid: Allow Bedrock to use the key
+          Effect: Allow
+          Principal:
+            Service: bedrock.amazonaws.com
+          Action:
+          - "kms:Decrypt"
+          - "kms:GenerateDataKey"
+          - "kms:DescribeKey"
+          Resource: "*"
+      Tags:
+      - Key: Name
+        Value: !Sub "${AppName}-${Environment}-bedrock-guardrail-key"
+      - Key: Application
+        Value: !Ref AppName
+      - Key: Environment
+        Value: !Ref Environment
+
+  BedrockGuardrailKmsKeyAlias:
+    Type: AWS::KMS::Alias
+    Condition: DeployApplicationServices
+    Properties:
+      AliasName: !Sub "alias/ail-${Environment}-bedrock-guardrail"
+      TargetKeyId: !Ref BedrockGuardrailKmsKey
+
+  # ---------------------------------------------------------------------------
+  # Bedrock Guardrail (merged from colleague-assist-bedrock-guardrail-cfn-template.yaml)
+  # Content filtering, PII masking and profanity detection for the complaint journey.
+  # Standalone template's EnvironmentName parameter maps onto this stack's Environment.
+  # ---------------------------------------------------------------------------
+  BedrockGuardrail:
+    Type: AWS::Bedrock::Guardrail
+    Condition: DeployApplicationServices
+    DependsOn:
+    - BedrockGuardrailKmsKey
+    Properties:
+      Name: !Sub "${AppName}-${Environment}-bedrock-guardrail"
+      Description: !Sub "Barclays AIL Complaint Journey - Content Guardrail (${Environment})"
+      BlockedInputMessaging: "Your input has been blocked by Barclays AI safety guardrails. Please revise and try again."
+      BlockedOutputsMessaging: "This content has been blocked by Barclays AI safety guardrails."
+      KmsKeyArn: !GetAtt BedrockGuardrailKmsKey.Arn
+
+      # Content Policy Configuration
+      ContentPolicyConfig:
+        FiltersConfig:
+          # Hate speech filter
+        - Type: HATE
+          InputStrength: HIGH
+          InputAction: NONE
+          OutputStrength: HIGH
+          OutputAction: NONE
+
+          # Insults filter
+        - Type: INSULTS
+          InputStrength: HIGH
+          InputAction: NONE
+          OutputStrength: HIGH
+          OutputAction: NONE
+
+          # Sexual content filter
+        - Type: SEXUAL
+          InputStrength: HIGH
+          InputAction: NONE
+          OutputStrength: HIGH
+          OutputAction: NONE
+
+          # Violence filter
+        - Type: VIOLENCE
+          InputStrength: HIGH
+          InputAction: NONE
+          OutputStrength: HIGH
+          OutputAction: NONE
+
+          # Misconduct filter
+        - Type: MISCONDUCT
+          InputStrength: HIGH
+          InputAction: NONE
+          OutputStrength: HIGH
+          OutputAction: NONE
+
+          # Prompt attack filter (input only - OutputStrength set to NONE as required by schema)
+        - Type: PROMPT_ATTACK
+          InputStrength: HIGH
+          InputAction: NONE
+          OutputStrength: NONE
+
+      # Word Policy Configuration (Profanity)
+      WordPolicyConfig:
+        ManagedWordListsConfig:
+        - Type: PROFANITY
+          InputAction: NONE
+          OutputAction: BLOCK
+
+      # Sensitive Information Policy Configuration
+      SensitiveInformationPolicyConfig:
+        # PII Entities Configuration (20 types)
+        PiiEntitiesConfig:
+          # Personal identifiers
+        - Type: NAME
+          Action: ANONYMIZE
+          InputAction: ANONYMIZE
+          OutputAction: ANONYMIZE
+        - Type: PHONE
+          Action: ANONYMIZE
+          InputAction: ANONYMIZE
+          OutputAction: ANONYMIZE
+        - Type: EMAIL
+          Action: ANONYMIZE
+          InputAction: ANONYMIZE
+          OutputAction: ANONYMIZE
+        - Type: ADDRESS
+          Action: ANONYMIZE
+          InputAction: ANONYMIZE
+          OutputAction: ANONYMIZE
+        - Type: AGE
+          Action: ANONYMIZE
+          InputAction: ANONYMIZE
+          OutputAction: ANONYMIZE
+        - Type: USERNAME
+          Action: ANONYMIZE
+          InputAction: ANONYMIZE
+          OutputAction: ANONYMIZE
+        - Type: PASSWORD
+          Action: ANONYMIZE
+          InputAction: ANONYMIZE
+          OutputAction: ANONYMIZE
+
+          # Identification documents
+        - Type: DRIVER_ID
+          Action: ANONYMIZE
+          InputAction: ANONYMIZE
+          OutputAction: ANONYMIZE
+        - Type: LICENSE_PLATE
+          Action: ANONYMIZE
+          InputAction: ANONYMIZE
+          OutputAction: ANONYMIZE
+        - Type: VEHICLE_IDENTIFICATION_NUMBER
+          Action: ANONYMIZE
+          InputAction: ANONYMIZE
+          OutputAction: ANONYMIZE
+
+          # Financial information
+          # CREDIT_DEBIT_CARD_CVV: AWS does not support input-side detection for CVV - InputEnabled set to false
+        - Type: CREDIT_DEBIT_CARD_CVV
+          Action: ANONYMIZE
+          InputEnabled: false
+          OutputAction: ANONYMIZE
+        - Type: CREDIT_DEBIT_CARD_EXPIRY
+          Action: ANONYMIZE
+          InputAction: ANONYMIZE
+          OutputAction: ANONYMIZE
+        - Type: CREDIT_DEBIT_CARD_NUMBER
+          Action: ANONYMIZE
+          InputAction: ANONYMIZE
+          OutputAction: ANONYMIZE
+        - Type: PIN
+          Action: ANONYMIZE
+          InputAction: ANONYMIZE
+          OutputAction: ANONYMIZE
+        - Type: INTERNATIONAL_BANK_ACCOUNT_NUMBER
+          Action: ANONYMIZE
+          InputAction: ANONYMIZE
+          OutputAction: ANONYMIZE
+        - Type: SWIFT_CODE
+          Action: ANONYMIZE
+          InputAction: ANONYMIZE
+          OutputAction: ANONYMIZE
+
+          # Network and UK-specific identifiers
+        - Type: IP_ADDRESS
+          Action: ANONYMIZE
+          InputAction: ANONYMIZE
+          OutputAction: ANONYMIZE
+        - Type: UK_UNIQUE_TAXPAYER_REFERENCE_NUMBER
+          Action: ANONYMIZE
+          InputAction: ANONYMIZE
+          OutputAction: ANONYMIZE
+        - Type: UK_NATIONAL_INSURANCE_NUMBER
+          Action: ANONYMIZE
+          InputAction: ANONYMIZE
+          OutputAction: ANONYMIZE
+        - Type: UK_NATIONAL_HEALTH_SERVICE_NUMBER
+          Action: ANONYMIZE
+          InputAction: ANONYMIZE
+          OutputAction: ANONYMIZE
+
+        # Custom Regex Patterns for UK-specific sensitive data (4 patterns)
+        RegexesConfig:
+          # UK Sort Code (format: XX-XX-XX or XX XX XX or XXXXXX)
+        - Name: UK_SORT_CODE
+          Pattern: '\b\d{2}[- ]?\d{2}[- ]?\d{2}\b'
+          Description: UK bank sort code
+          Action: ANONYMIZE
+          InputAction: ANONYMIZE
+          OutputAction: ANONYMIZE
+
+          # UK IBAN (format: GBXX XXXX XXXX XXXX XXXX XX)
+        - Name: UK_IBAN
+          Pattern: '\bGB\d{2}[A-Z]{4}\d{14}\b'
+          Description: UK International Bank Account Number
+          Action: ANONYMIZE
+          InputAction: ANONYMIZE
+          OutputAction: ANONYMIZE
+
+          # UK NHS Number (format: XXX XXX XXXX or XXX-XXX-XXXX)
+        - Name: UK_NHS_NUMBER
+          Pattern: '\b\d{3}[\s\-]?\d{3}[\s\-]?\d{4}\b'
+          Description: UK National Health Service number
+          Action: ANONYMIZE
+          InputAction: ANONYMIZE
+          OutputAction: ANONYMIZE
+
+          # UK Postcode (format: A9A 9AA or A99 9AA, etc.)
+        - Name: UK_POSTCODE
+          Pattern: '\b[A-Z]{1,2}[0-9][0-9A-Z]?\s*[0-9][A-Z]{2}\b'
+          Description: UK postal code
+          Action: ANONYMIZE
+          InputAction: ANONYMIZE
+          OutputAction: ANONYMIZE
+
+      Tags:
+      - Key: Environment
+        Value: !Ref Environment
+      - Key: Component
+        Value: BedrockGuardrail
+      - Key: Application
+        Value: !Ref AppName
+
+  GuardrailIdSsmParameter:
+    Type: AWS::SSM::Parameter
+    Condition: DeployApplicationServices
+    Properties:
+      Name: !Sub "/ail/${Environment}/guardrail/id"
+      Type: String
+      Value: !GetAtt BedrockGuardrail.GuardrailId
+      Description: !Sub "Bedrock Guardrail ID for ${AppName}-${Environment}."
+      Tags:
+        Application: !Ref AppName
+        Environment: !Ref Environment
+
+  GuardrailVersionSsmParameter:
+    Type: AWS::SSM::Parameter
+    Condition: DeployApplicationServices
+    Properties:
+      Name: !Sub "/ail/${Environment}/guardrail/version"
+      Type: String
+      Value: !GetAtt BedrockGuardrail.Version
+      Description: !Sub "Bedrock Guardrail version for ${AppName}-${Environment}."
+      Tags:
+        Application: !Ref AppName
+        Environment: !Ref Environment
+
+  GuardrailKmsKeyArnSsmParameter:
+    Type: AWS::SSM::Parameter
+    Condition: DeployApplicationServices
+    Properties:
+      Name: !Sub "/ail/${Environment}/kms/bedrock-guardrail/key-arn"
+      Type: String
+      Value: !GetAtt BedrockGuardrailKmsKey.Arn
+      Description: !Sub "KMS key ARN for Bedrock Guardrail encryption - ${AppName}-${Environment}."
+      Tags:
+        Application: !Ref AppName
+        Environment: !Ref Environment
+
+  # ---------------------------------------------------------------------------
+  # Security Group IDs stored in SSM Parameter Store
+  # ---------------------------------------------------------------------------
+  AgentCoreSecurityGroupIdParameter:
+    Type: AWS::SSM::Parameter
+    Condition: DeployApplicationServices
+    Properties:
+      Name: !Sub "/ail/${Environment}/network/agentcore/additional-sg"
+      Type: String
+      Value: !Ref AgentCoreAdditionalSecurityGroup
+      Description: !Sub "AgentCore additional security group ID for ${AppName}-${Environment}."
+      Tags:
+        Application: !Ref AppName
+        Environment: !Ref Environment
+
+  LambdaSecurityGroupIdParameter:
+    Type: AWS::SSM::Parameter
+    Condition: DeployApplicationServices
+    Properties:
+      Name: !Sub "/ail/${Environment}/network/lambda/additional-sg"
+      Type: String
+      Value: !Ref LambdaSecurityGroup
+      Description: !Sub "Lambda security group ID for ${AppName}-${Environment}."
+      Tags:
+        Application: !Ref AppName
+        Environment: !Ref Environment
+
+  RedisSecurityGroupIdParameter:
+    Type: AWS::SSM::Parameter
+    Condition: DeployApplicationServices
+    Properties:
+      Name: !Sub "/ail/${Environment}/network/redis/additional-sg"
+      Type: String
+      Value: !Ref RedisAdditionalSecurityGroup
+      Description: !Sub "Redis additional security group ID for ${AppName}-${Environment}."
+      Tags:
+        Application: !Ref AppName
+        Environment: !Ref Environment
+
+  AgentCoreExecutionRoleArnParameter:
+    Type: AWS::SSM::Parameter
+    Condition: DeployApplicationServices
+    Properties:
+      Name: !Sub "/ail/${Environment}/network/agentcore/execution-role"
+      Type: String
+      Value: !GetAtt AgentCoreRuntimeExecutionRole.Arn
+      Description: !Sub "AgentCore runtime execution role ARN for ${AppName}-${Environment}."
+      Tags:
+        Application: !Ref AppName
+        Environment: !Ref Environment
+
+  # ---------------------------------------------------------------------------
+  # Lambda IAM role for normal CloudFormation-created Lambda
+  # ---------------------------------------------------------------------------
+  InteractionStreamLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Condition: DeployApplicationServices
+    Properties:
+      RoleName: !Sub "svc-${AppName}-${Environment}-lambda-role"
+      PermissionsBoundary: !If [HasPermissionsBoundary, !Ref PermissionsBoundaryArn, !Ref "AWS::NoValue"]
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action: sts:AssumeRole
+      ManagedPolicyArns:
+        # Plan.md 6.1 - AWSLambdaBasicExecutionRole REMOVED. It granted
+        # logs:CreateLogGroup on "*", letting the runtime auto-create an
+        # ungoverned log group (no retention/tags/encryption). Its CreateLogStream
+        # and PutLogEvents grants are replaced by the scoped WriteLogs Sid below.
+        # AWSLambdaVPCAccessExecutionRole is retained - required for ENI management.
+      - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+      - PolicyName: SQSReadAccess
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+          - Sid: SQSConsumeMessages
+            Effect: Allow
+            Action:
+            - sqs:ReceiveMessage
+            - sqs:DeleteMessage
+            - sqs:GetQueueAttributes
+            - sqs:ChangeMessageVisibility
+            Resource: !GetAtt SqsFifoQueue.Arn
+          - Sid: SQSKMSDecrypt
+            Effect: Allow
+            Action:
+            - kms:Decrypt
+            - kms:GenerateDataKey
+            Resource: !GetAtt SqsKmsKey.Arn
+
+      # Logging kept in its own policy so the intent is obvious. CreateLogGroup
+      # is deliberately NOT granted: LambdaLogGroup owns creation, retention,
+      # tagging and deletion policy, and a runtime-created group would be ungoverned.
+      - PolicyName: LogsAndTracing
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+          - Sid: WriteLogs
+            Effect: Allow
+            Action:
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+            Resource:
+            - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AppName}-${Environment}-interaction-stream-lambda:*"
+          # The function sets Tracing: Active. Because the role is supplied
+          # explicitly, SAM does not attach AWSXRayDaemonWriteAccess for us and
+          # AWSLambdaVPCAccessExecutionRole does not include X-Ray either, so
+          # without this block tracing is enabled but silently emits nothing.
+          - Sid: XRayTracing
+            Effect: Allow
+            Action:
+            - xray:PutTraceSegments
+            - xray:PutTelemetryRecords
+            Resource: "*"
+
+      - PolicyName: InvokeAgentCoreRuntime
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+          - Sid: InvokeAgentRuntime
+            Effect: Allow
+            Action:
+            - bedrock-agentcore:InvokeAgentRuntime
+            Resource:
+            - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:runtime/*"
+
+          - Sid: StopAgentCoreSession
+            Effect: Allow
+            Action:
+            - bedrock-agentcore:StopRuntimeSession
+            Resource:
+            - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:runtime/*"
+
+      # S3ReadPolicy removed: it granted s3:GetObject on "ail-assist-artifacts-*"
+      # across every environment and account-suffix in the region. The
+      # ArtifactsBucketReadAndDecrypt policy below covers the same need scoped to
+      # this environment's bucket only.
+      - PolicyName: SSMReadPolicy
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+          - Sid: SSMParameterRead
+            Effect: Allow
+            Action:
+            - ssm:GetParameter
+            - ssm:GetParameters
+            - ssm:GetParametersByPath
+            Resource:
+            # Scoped to this environment: a sit Lambda has no reason to read
+            # /ail/prod/ parameters.
+            - !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/ail/${Environment}/*"
+
+      - PolicyName: SecretsManagerReadPolicy
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+          - Sid: SecretsManagerAccess
+            Effect: Allow
+            Action:
+            - secretsmanager:GetSecretValue
+            Resource:
+                  # Scoped to Redis auth secret only (C1 fix — was secret:*)
+            - !GetAtt RedisProvisionedProduct.Outputs.CacheSecretArn
+
+      - PolicyName: KMSDecryptPolicy
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+          - Sid: KMSDecryptBedrockGuardrail
+            Effect: Allow
+            Action:
+            - kms:Decrypt
+            Resource:
+                  # Scoped to Bedrock Guardrail KMS key only (C2 fix — was key/*)
+            - !GetAtt BedrockGuardrailKmsKey.Arn
+          - Sid: KMSDecryptViaSecretsManager
+            Effect: Allow
+            Action:
+            - kms:Decrypt
+            - kms:DescribeKey
+            Resource:
+                  # Allow decrypt for any key, but ONLY when accessed through
+                  # Secrets Manager (covers Redis secret's encryption key which
+                  # is created by the Service Catalog product — ARN not available here)
+            - !Sub "arn:aws:kms:${AWS::Region}:${AWS::AccountId}:key/*"
+            Condition:
+              StringEquals:
+                kms:ViaService: !Sub "secretsmanager.${AWS::Region}.amazonaws.com"
+      - PolicyName: ArtifactsBucketReadAndDecrypt
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Sid: ReadStaticArtifactsBucket
+            Effect: Allow
+            Action:
+            - s3:ListBucket
+            Resource: !Sub "arn:aws:s3:::ail-assist-artifacts-${Environment}-${AWS::AccountId}"
+          - Sid: ReadStaticArtifactsObjects
+            Effect: Allow
+            Action:
+            - s3:GetObject
+            - s3:GetObjectVersion
+            Resource: !Sub "arn:aws:s3:::ail-assist-artifacts-${Environment}-${AWS::AccountId}/*"
+          - Sid: DecryptArtifacts
+            Effect: Allow
+            Action:
+            - kms:Decrypt
+            - kms:DescribeKey
+            Resource: !GetAtt ArtifactsKmsKey.Arn
+      Tags:
+      - Key: Application
+        Value: !Ref AppName
+      - Key: Environment
+        Value: !Ref Environment
+
+  # ---------------------------------------------------------------------------
+  # Plan.md 6.1 - governed Lambda log group.
+  # Pre-created so retention, tags and deletion policy are owned by IaC instead
+  # of the Lambda runtime auto-creating an ungoverned group on first invocation.
+  # The name MUST be exactly /aws/lambda/<FunctionName>; if it drifts from the
+  # FunctionName below, Lambda ignores this group and silently creates its own.
+  # ---------------------------------------------------------------------------
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: DeployApplicationServices
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AppName}-${Environment}-interaction-stream-lambda"
+      RetentionInDays: !Ref LogRetentionInDays
+      Tags:
+      - Key: Team
+        Value: CDAO
+      - Key: Service
+        Value: AIL-ColleagueAssist
+      - Key: Application
+        Value: !Ref AppName
+      - Key: Environment
+        Value: !Ref Environment
+
+  # ---------------------------------------------------------------------------
+  # Normal Lambda function created directly by CloudFormation
+  # ---------------------------------------------------------------------------
+  InteractionStreamLambda:
+    Type: AWS::Serverless::Function
+    Condition: DeployApplicationServices
+    DependsOn:
+    - LambdaSecurityGroup
+    - InteractionStreamLambdaExecutionRole
+    - LambdaLogGroup
+    - RedisProvisionedProduct
+    Properties:
+      FunctionName: !Sub "${AppName}-${Environment}-interaction-stream-lambda"
+      Description: !Ref LambdaDescription
+      CodeUri: ./src/connect_adapter/
+      # CodeUri:
+      #   Bucket: !Ref LambdaS3BucketName
+      #   Key: !Ref LambdaCodeKeyName
+      Runtime: !Ref LambdaRuntime
+      Handler: !Ref LambdaHandler
+      Role: !GetAtt InteractionStreamLambdaExecutionRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      Architectures:
+      - !Ref LambdaArchitecture
+      Tracing: !Ref LambdaTracing
+      VpcConfig:
+        SecurityGroupIds:
+        - !Ref LambdaSecurityGroup
+        SubnetIds:
+        - !Ref LambdaSubnet1
+        - !Ref LambdaSubnet2
+      Environment:
+        Variables:
+          AWS_ACCOUNT_ID: !Sub "${AWS::AccountId}"
+          TARGET_AWS_REGION: !Sub "${AWS::Region}"
+          REDIS_CONFIG_VAR: !Ref RedisVarName
+          AGENTCORE_CONFIG_VAR: !Ref AgentCoreVarName
+          COMMON_CONFIG_VAR: !Sub "/ail/${Environment}/network/common/config"
+          CONNECT_TIMEOUT: !Sub "${ConnectTimeoutSeconds}"
+          REDIS_SECRET_ARN: !GetAtt RedisProvisionedProduct.Outputs.CacheSecretArn
+          SESSION_TTL_SECONDS: !Sub "${SessionTtlSeconds}"
+          SOCKET_TIMEOUT: !Sub "${SocketTimeoutSeconds}"
+      Tags:
+        Application: !Ref AppName
+        Environment: !Ref Environment
+
+  # ---------------------------------------------------------------------------
+  # Connectivity: allow Lambda SG into Redis SG on Redis port
+  # ---------------------------------------------------------------------------
+  RedisIngressFromLambda:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: DeployApplicationServices
+    Properties:
+      GroupId: !Ref RedisAdditionalSecurityGroup
+      IpProtocol: tcp
+      FromPort: !Ref RedisPort
+      ToPort: !Ref RedisPort
+      SourceSecurityGroupId: !Ref LambdaSecurityGroup
+      Description: !Sub "Allow Lambda to Redis on port ${RedisPort}"
+
+  RedisIngressFromAgentCore:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: DeployApplicationServices
+    Properties:
+      GroupId: !Ref RedisAdditionalSecurityGroup
+      IpProtocol: tcp
+      FromPort: !Ref RedisPort
+      ToPort: !Ref RedisPort
+      SourceSecurityGroupId: !Ref AgentCoreAdditionalSecurityGroup
+      Description: !Sub "Allow AgentCore to Redis on port ${RedisPort}"
+
+  AgentCoreIngressFromLambda:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: DeployApplicationServices
+    Properties:
+      GroupId: !Ref AgentCoreAdditionalSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      SourceSecurityGroupId: !Ref LambdaSecurityGroup
+      Description: !Sub "Allow Lambda to invoke AgentCore on port 443"
+
+
+  # ---------------------------------------------------------------------------
+  # Redis Service Catalog product
+  # ---------------------------------------------------------------------------
+  RedisProvisionedProduct:
+    Type: AWS::ServiceCatalog::CloudFormationProvisionedProduct
+    Condition: DeployApplicationServices
+    DependsOn:
+    - RedisAdditionalSecurityGroup
+    Properties:
+      ProductId: !Ref RedisProductId
+      ProvisioningArtifactId: !Ref RedisProvisioningArtifactId
+      ProvisionedProductName: !Sub "${AppName}-${Environment}-redis"
+      ProvisioningParameters:
+      - Key: FriendlyStackName
+        Value: !Sub "ail-${Environment}-redis"
+      - Key: CacheNodeType
+        Value: !Ref RedisCacheNodeType
+      - Key: EngineVersion
+        Value: !Ref RedisEngineVersion
+      - Key: RedisPort
+        Value: !Ref RedisPort
+      - Key: NumNodeGroups
+        Value: !Ref RedisNumNodeGroups
+      - Key: ReplicasPerNodeGroup
+        Value: !Ref RedisReplicasPerNodeGroup
+      - Key: MultiAZEnabled
+        Value: !Ref RedisMultiAZEnabled
+      - Key: SnapshotRetentionLimit
+        Value: !Ref RedisSnapshotRetentionLimit
+      - Key: AdditionalSG
+        Value: !Ref RedisAdditionalSecurityGroup
+      - Key: Subnet1
+        Value: !Ref ElastiCacheSubnet1
+      - Key: Subnet2
+        Value: !Ref ElastiCacheSubnet2
+      - Key: Subnet3
+        Value: !Ref ElastiCacheSubnet1
+      - Key: VpcId
+        Value: !Ref VpcIdPath
+      - Key: LogFormat
+        Value: !Ref RedisLogFormat
+      - Key: LogType
+        Value: !Ref RedisLogType
+      - Key: LogRetentionDays
+        Value: !Ref RedisLogRetentionDays
+      - Key: CacheLogsEnabled
+        Value: !Ref RedisCacheLogsEnabled
+      Tags:
+      - Key: Application
+        Value: !Ref AppName
+      - Key: Environment
+        Value: !Ref Environment
+
+  # ---------------------------------------------------------------------------
+  # SQS FIFO queue — KMS encryption key
+  # ---------------------------------------------------------------------------
+  SqsKmsKey:
+    Type: AWS::KMS::Key
+    Condition: DeployApplicationServices
+    Properties:
+      Description: !Sub "KMS key for ${AppName}-${Environment} SQS FIFO queue encryption"
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+        - Sid: EnableRootAccount
+          Effect: Allow
+          Principal:
+            AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+          Action: kms:*
+          Resource: "*"
+      Tags:
+      - Key: Application
+        Value: !Ref AppName
+      - Key: Environment
+        Value: !Ref Environment
+
+  SqsKmsKeyAlias:
+    Type: AWS::KMS::Alias
+    Condition: DeployApplicationServices
+    Properties:
+      AliasName: !Sub "alias/${AppName}-sqs-${Environment}"
+      TargetKeyId: !Ref SqsKmsKey
+
+  # ---------------------------------------------------------------------------
+  # SQS FIFO queue — dead-letter queue + main queue
+  # ---------------------------------------------------------------------------
+  SqsDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Condition: DeployApplicationServices
+    Properties:
+      QueueName: !Sub "${AppName}-${Environment}-sqs-dlq.fifo"
+      FifoQueue: true
+      MessageRetentionPeriod: 1209600
+      KmsMasterKeyId: !GetAtt SqsKmsKey.Arn
+      KmsDataKeyReusePeriodSeconds: 300
+      Tags:
+      - Key: Application
+        Value: !Ref AppName
+      - Key: Environment
+        Value: !Ref Environment
+
+  SqsFifoQueue:
+    Type: AWS::SQS::Queue
+    Condition: DeployApplicationServices
+    Properties:
+      QueueName: !Sub "${AppName}-${Environment}-sqs.fifo"
+      FifoQueue: true
+      VisibilityTimeout: 360
+      MessageRetentionPeriod: 345600
+      ContentBasedDeduplication: false
+      ReceiveMessageWaitTimeSeconds: 20
+      DelaySeconds: 0
+      MaximumMessageSize: 262144
+      KmsMasterKeyId: !GetAtt SqsKmsKey.Arn
+      KmsDataKeyReusePeriodSeconds: 300
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt SqsDeadLetterQueue.Arn
+        maxReceiveCount: 3
+      Tags:
+      - Key: Application
+        Value: !Ref AppName
+      - Key: Environment
+        Value: !Ref Environment
+
+  # ---------------------------------------------------------------------------
+  # Cross-account IAM role for SQS forwarder Lambda (conditional)
+  # ---------------------------------------------------------------------------
+  SqsForwarderCrossAccountRole:
+    Type: AWS::IAM::Role
+    Condition: DeployApplicationServicesAndHasCrossAccountForwarder
+    Properties:
+      RoleName: !Sub "svc-${AppName}-${Environment}-ve-sqs-forwarder-role"
+      PermissionsBoundary: !If [HasPermissionsBoundary, !Ref PermissionsBoundaryArn, !Ref "AWS::NoValue"]
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+        - Effect: Allow
+          Principal:
+            AWS: !Ref SourceAccountForwarderRoleArn
+          Action: sts:AssumeRole
+      Policies:
+      - PolicyName: SqsSendAccess
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+          - Sid: SQSSendMessages
+            Effect: Allow
+            Action:
+            - sqs:SendMessage
+            - sqs:GetQueueAttributes
+            - sqs:GetQueueUrl
+            Resource: !GetAtt SqsFifoQueue.Arn
+          - Sid: KMSEncryptForSQS
+            Effect: Allow
+            Action:
+            - kms:GenerateDataKey
+            - kms:Decrypt
+            Resource: !GetAtt SqsKmsKey.Arn
+      Tags:
+      - Key: Application
+        Value: !Ref AppName
+      - Key: Environment
+        Value: !Ref Environment
+
+  # ---------------------------------------------------------------------------
+  # SQS FIFO event source mapping on Lambda
+  # ---------------------------------------------------------------------------
+  SQSEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Condition: DeployApplicationServices
+    DependsOn:
+    - InteractionStreamLambda
+    - InteractionStreamLambdaExecutionRole
+    - SqsFifoQueue
+    Properties:
+      EventSourceArn: !GetAtt SqsFifoQueue.Arn
+      FunctionName: !GetAtt InteractionStreamLambda.Arn
+      BatchSize: 10
+      FunctionResponseTypes:
+      - ReportBatchItemFailures
+      ScalingConfig:
+        MaximumConcurrency: 10
+      Enabled: true
+
+  # ---------------------------------------------------------------------------
+  # SSM Parameters — connection config created after infra is provisioned
+  # ---------------------------------------------------------------------------
+  RedisConfigParameter:
+    Type: AWS::SSM::Parameter
+    Condition: DeployApplicationServices
+    DependsOn:
+    - RedisProvisionedProduct
+    Properties:
+      Name: !Ref RedisVarName
+      Type: String
+      Value: !Sub
+      - |
+        {
+          "host": "${RedisEndpoint}",
+          "port": 6379,
+          "ssl": true,
+          "redis_url": "redis://${RedisEndpoint}:6379",
+          "primary_endpoint": "${RedisEndpoint}",
+          "redis_tls": "true",
+          "auth_secret_arn": "${RedisSecretArn}"
+        }
+      - RedisEndpoint: !GetAtt RedisProvisionedProduct.Outputs.CachePrimaryEndPointAddress
+        RedisSecretArn: !GetAtt RedisProvisionedProduct.Outputs.CacheSecretArn
+      Description: !Sub "Redis connection config for ${AppName}-${Environment} Lambda."
+      Tags:
+        Application: !Ref AppName
+        Environment: !Ref Environment
+
+  AgentCoreConfigParameter:
+    Type: AWS::SSM::Parameter
+    Condition: DeployApplicationServices
+    Properties:
+      Name: !Ref AgentCoreVarName
+      Type: String
+      Value: !Sub
+      - |
+        {
+          "product_holdings_url": "https://zuul-gateway-pt-a-25960.np4.apaas4.barclays.intranet/cct-semantic-mediation-api/1/sml/v1/complaintevents/RETRIEVE_PRODUCT",
+          "pcr_l1_segment_url": "https://zuul-gateway-pt-a-25960.np4.apaas4.barclays.intranet/cct-semantic-mediation-api/1/sml/v1/complaintevents/RETRIEVE_PCR",
+          "api_gateway_host": "t7kghpblwg.execute-api.us-east-1.amazonaws.com",
+          "haiku_model_id": "eu.anthropic.claude-haiku-4-5-20251001-v1:0",
+          "sonnet_model_id": "eu.anthropic.claude-sonnet-4-5-20250929-v1:0",
+          "guardrail_id": "${GuardrailId}",
+          "guardrail_version": "${GuardrailVersion}"
+        }
+      - GuardrailId: !GetAtt BedrockGuardrail.GuardrailId
+        GuardrailVersion: !GetAtt BedrockGuardrail.Version
+      Description: !Sub "AgentCore connection config for ${AppName}-${Environment} Lambda."
+      Tags:
+        Application: !Ref AppName
+        Environment: !Ref Environment
+
+  # ---------------------------------------------------------------------------
+  # SQS SSM Parameters — queue config for downstream consumers + forwarder team
+  # ---------------------------------------------------------------------------
+  SqsConfigParameter:
+    Type: AWS::SSM::Parameter
+    Condition: DeployApplicationServices
+    DependsOn:
+    - SqsFifoQueue
+    - SqsDeadLetterQueue
+    - SqsKmsKey
+    Properties:
+      Name: !Sub "/ail/${Environment}/network/sqs/config"
+      Type: String
+      Value: !Sub
+      - '{"queue_url": "${QueueUrl}", "queue_arn": "${QueueArn}", "dlq_arn": "${DlqArn}", "kms_key_arn": "${KmsArn}"}'
+      - QueueUrl: !Ref SqsFifoQueue
+        QueueArn: !GetAtt SqsFifoQueue.Arn
+        DlqArn: !GetAtt SqsDeadLetterQueue.Arn
+        KmsArn: !GetAtt SqsKmsKey.Arn
+      Description: !Sub "SQS FIFO queue connection config for ${AppName}-${Environment}."
+      Tags:
+        Application: !Ref AppName
+        Environment: !Ref Environment
+
+  SqsQueueUrlParameter:
+    Type: AWS::SSM::Parameter
+    Condition: DeployApplicationServices
+    DependsOn:
+    - SqsFifoQueue
+    Properties:
+      Name: !Sub "/ail/${Environment}/network/sqs/queue-url"
+      Type: String
+      Value: !Ref SqsFifoQueue
+      Description: !Sub "SQS FIFO queue URL for forwarder team cross-account lookup (${AppName}-${Environment})."
+      Tags:
+        Application: !Ref AppName
+        Environment: !Ref Environment
+
+  ForwarderRoleArnParameter:
+    Type: AWS::SSM::Parameter
+    Condition: DeployApplicationServicesAndHasCrossAccountForwarder
+    Properties:
+      Name: !Sub "/ail/${Environment}/network/sqs/forwarder-role-arn"
+      Type: String
+      Value: !GetAtt SqsForwarderCrossAccountRole.Arn
+      Description: !Sub "Cross-account forwarder role ARN for ${AppName}-${Environment}."
+      Tags:
+        Application: !Ref AppName
+        Environment: !Ref Environment
+
+  # ---------------------------------------------------------------------------
+  # CloudWatch Alarms — SQS DLQ monitoring
+  # ---------------------------------------------------------------------------
+  DLQDepthAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: DeployApplicationServices
+    DependsOn:
+    - SqsDeadLetterQueue
+    Properties:
+      AlarmName: !Sub "${AppName}-${Environment}-sqs-dlq-depth"
+      AlarmDescription: "Messages landed in the DLQ — investigate failed records."
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+      - Name: QueueName
+        Value: !GetAtt SqsDeadLetterQueue.QueueName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  MessageAgeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: DeployApplicationServices
+    DependsOn:
+    - SqsFifoQueue
+    Properties:
+      AlarmName: !Sub "${AppName}-${Environment}-sqs-message-age"
+      AlarmDescription: "Oldest message in queue exceeds 5 minutes — possible processing stall."
+      Namespace: AWS/SQS
+      MetricName: ApproximateAgeOfOldestMessage
+      Dimensions:
+      - Name: QueueName
+        Value: !GetAtt SqsFifoQueue.QueueName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 300
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  CommonConfigParameter:
+    Type: AWS::SSM::Parameter
+    Condition: DeployApplicationServices
+    Properties:
+      Name: !Sub "/ail/${Environment}/network/common/config"
+      Type: String
+      Value: !Sub |
+        {
+          "push_endpoint_url": "https://colleague-help-hub-xapi-${Environment}.barclays.intranet/help-hub-xapi-colleague-assistant/AIAssist/Events",
+          "push_endpoint_host": "colleague-help-hub-xapi-${Environment}.barclays.intranet",
+          "tiaa_jwks_url": "https://tiaa.barcapint.com/.well-known/jwks.json",
+          "tiaa_issuer": "TIAA-AS",
+          "tiaa_audience": "IBDN",
+          "tiaa_token_secret_arn": "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:genaiTiaaSecretStore-frX1VI",
+          "helphub_token_secret_arn": "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:genaiTiaaSecretStore-frX1VI",
+          "sml_token_secret_arn": "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:genaiTiaaSecretStore-frX1VI",
+          "cb_failure_threshold": "3",
+          "cb_recovery_timeout_seconds": "30",
+          "mock_endpoints_enabled": "false",
+          "product_holdings_mock_url": "https://vpce-086fad28fa7e079d4-kq6j1o5a.execute-api.${AWS::Region}.vpce.amazonaws.com/v1/complaintevents/RETRIEVE_PRODUCT",
+          "pcr_l1_segment_mock_url": "https://vpce-086fad28fa7e079d4-kq6j1o5a.execute-api.${AWS::Region}.vpce.amazonaws.com/v1/complaintevents/RETRIEVE_PCR",
+          "push_endpoint_mock_url": "https://vpce-086fad28fa7e079d4-kq6j1o5a.execute-api.${AWS::Region}.vpce.amazonaws.com/v1/pushToHelphub",
+          "mock_host_url": "22mb1zskxg",
+          "log_level": "DEBUG",
+          "token_secret_arn":"arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:genaiTiaaSecretStore-frX1VI",
+          "ail_assist_api_base_url":"https://sit.assisted.complaints.barclays.intranet",
+          "ail_assist_api_version":"v1",
+          "ail_assist_api_app_path":"/invoke"
+        }
+      Description: !Sub "Common config for ${AppName}-${Environment} (push endpoints, TIAA auth, circuit breaker, mock endpoints)."
+      Tags:
+        Application: !Ref AppName
+        Environment: !Ref Environment
+
+  # ===========================================================================
+  # Application-Level Monitoring - Metric Filters & Alarms
+  # Aligned with colleague-assist-log-approach-v2.md (§7.2-7.3)
+  # and connect-adapter-log-approach-v2.md (§6.2-6.3).
+  # 24 metric filters + 19 CloudWatch alarms on structured log events.
+  # Infrastructure alarms (Redis, Kinesis, ALB) are owned by the infra team.
+  # ===========================================================================
+
+  # --- AgentCore Metric Filters (event type) ---
+
+  AgentInvocationErrorsFilter:
+    Type: AWS::Logs::MetricFilter
+    Condition: DeployApplicationServicesAndHasAgentCoreLogGroup
+    Properties:
+      LogGroupName: !Ref AgentCoreLogGroupName
+      # CloudWatch JSON filter patterns compare booleans with IS TRUE / IS FALSE.
+      # "= false" never matches and the metric stays silently at zero.
+      FilterPattern: '{ $.event_type = "AGENT_INVOCATION" && $.attributes.success IS FALSE }'
+      MetricTransformations:
+      - MetricNamespace: !Sub "AIL/${Environment}"
+        MetricName: AgentErrors
+        MetricValue: "1"
+        DefaultValue: 0
+
+  LLMLatencyFilter:
+    Type: AWS::Logs::MetricFilter
+    Condition: DeployApplicationServicesAndHasAgentCoreLogGroup
+    Properties:
+      LogGroupName: !Ref AgentCoreLogGroupName
+      FilterPattern: '{ $.event_type = "LLM_CALL" && $.attributes.latency_ms >= 0 }'
+      MetricTransformations:
+      - MetricNamespace: !Sub "AIL/${Environment}"
+        MetricName: LLMLatencyMs
+        MetricValue: "$.attributes.latency_ms"
+        DefaultValue: 0
+
+  LLMTokenUsageFilter:
+    Type: AWS::Logs::MetricFilter
+    Condition: DeployApplicationServicesAndHasAgentCoreLogGroup
+    Properties:
+      LogGroupName: !Ref AgentCoreLogGroupName
+      FilterPattern: '{ $.event_type = "LLM_CALL" && $.attributes.total_tokens > 0 }'
+      MetricTransformations:
+      - MetricNamespace: !Sub "AIL/${Environment}"
+        MetricName: LLMTokensUsed
+        MetricValue: "$.attributes.total_tokens"
+        DefaultValue: 0
+
+  WorkerErrorsFilter:
+    Type: AWS::Logs::MetricFilter
+    Condition: DeployApplicationServicesAndHasAgentCoreLogGroup
+    Properties:
+      LogGroupName: !Ref AgentCoreLogGroupName
+      FilterPattern: '{ $.event_type = "WORKER_LIFECYCLE" && $.attributes.action = "error" }'
+      MetricTransformations:
+      - MetricNamespace: !Sub "AIL/${Environment}"
+        MetricName: WorkerErrors
+        MetricValue: "1"
+        DefaultValue: 0
+
+  QueueEnqueuesFilter:
+    Type: AWS::Logs::MetricFilter
+    Condition: DeployApplicationServicesAndHasAgentCoreLogGroup
+    Properties:
+      LogGroupName: !Ref AgentCoreLogGroupName
+      FilterPattern: '{ $.event_type = "QUEUE_ENQUEUE" }'
+      MetricTransformations:
+      - MetricNamespace: !Sub "AIL/${Environment}"
+        MetricName: QueueEnqueues
+        MetricValue: "1"
+        DefaultValue: 0
+
+  PriorityInterruptsFilter:
+    Type: AWS::Logs::MetricFilter
+    Condition: DeployApplicationServicesAndHasAgentCoreLogGroup
+    Properties:
+      LogGroupName: !Ref AgentCoreLogGroupName
+      FilterPattern: '{ $.event_type = "PRIORITY_INTERRUPT" }'
+      MetricTransformations:
+      - MetricNamespace: !Sub "AIL/${Environment}"
+        MetricName: PriorityInterrupts
+        MetricValue: "1"
+        DefaultValue: 0
+
+  LLMErrorsFilter:
+    Type: AWS::Logs::MetricFilter
+    Condition: DeployApplicationServicesAndHasAgentCoreLogGroup
+    Properties:
+      LogGroupName: !Ref AgentCoreLogGroupName
+      FilterPattern: '{ $.event_type = "LLM_CALL" && $.level = "ERROR" }'
+      MetricTransformations:
+      - MetricNamespace: !Sub "AIL/${Environment}"
+        MetricName: LLMErrors
+        MetricValue: "1"
+        DefaultValue: 0
+
+  PushOutputErrorsFilter:
+    Type: AWS::Logs::MetricFilter
+    Condition: DeployApplicationServicesAndHasAgentCoreLogGroup
+    Properties:
+      LogGroupName: !Ref AgentCoreLogGroupName
+      FilterPattern: '{ $.event_type = "PUSH_OUTPUT" && $.level = "ERROR" }'
+      MetricTransformations:
+      - MetricNamespace: !Sub "AIL/${Environment}"
+        MetricName: PushOutputErrors
+        MetricValue: "1"
+        DefaultValue: 0
+
+  # --- AgentCore Metric Filters (AIL_ERR_XXX error codes) ---
+
+  AILAgentDispatchErrorsFilter:
+    Type: AWS::Logs::MetricFilter
+    Condition: DeployApplicationServicesAndHasAgentCoreLogGroup
+    Properties:
+      LogGroupName: !Ref AgentCoreLogGroupName
+      FilterPattern: '{ $.error_code = "AIL_ERR_001" || $.error_code = "AIL_ERR_002" }'
+      MetricTransformations:
+      - MetricNamespace: !Sub "AIL/${Environment}"
+        MetricName: AILAgentDispatchErrors
+        MetricValue: "1"
+        DefaultValue: 0
+
+  AILConfigRoutingErrorsFilter:
+    Type: AWS::Logs::MetricFilter
+    Condition: DeployApplicationServicesAndHasAgentCoreLogGroup
+    Properties:
+      LogGroupName: !Ref AgentCoreLogGroupName
+      FilterPattern: '{ $.error_code = "AIL_ERR_003" || $.error_code = "AIL_ERR_006" || $.error_code = "AIL_ERR_013" }'
+      MetricTransformations:
+      - MetricNamespace: !Sub "AIL/${Environment}"
+        MetricName: AILConfigRoutingErrors
+        MetricValue: "1"
+        DefaultValue: 0
+
+  AILOrchestratorPushErrorsFilter:
+    Type: AWS::Logs::MetricFilter
+    Condition: DeployApplicationServicesAndHasAgentCoreLogGroup
+    Properties:
+      LogGroupName: !Ref AgentCoreLogGroupName
+      FilterPattern: '{ $.error_code = "AIL_ERR_004" || $.error_code = "AIL_ERR_007" }'
+      MetricTransformations:
+      - MetricNamespace: !Sub "AIL/${Environment}"
+        MetricName: AILOrchestratorPushErrors
+        MetricValue: "1"
+        DefaultValue: 0
+
+  AILSessionStateErrorsFilter:
+    Type: AWS::Logs::MetricFilter
+    Condition: DeployApplicationServicesAndHasAgentCoreLogGroup
+    Properties:
+      LogGroupName: !Ref AgentCoreLogGroupName
+      FilterPattern: '{ $.error_code = "AIL_ERR_005" || $.error_code = "AIL_ERR_011" || $.error_code = "AIL_ERR_012" }'
+      MetricTransformations:
+      - MetricNamespace: !Sub "AIL/${Environment}"
+        MetricName: AILSessionStateErrors
+        MetricValue: "1"
+        DefaultValue: 0
+
+  AILGuardrailTriggeredFilter:
+    Type: AWS::Logs::MetricFilter
+    Condition: DeployApplicationServicesAndHasAgentCoreLogGroup
+    Properties:
+      LogGroupName: !Ref AgentCoreLogGroupName
+      FilterPattern: '{ $.error_code = "AIL_ERR_008" }'
+      MetricTransformations:
+      - MetricNamespace: !Sub "AIL/${Environment}"
+        MetricName: AILGuardrailTriggered
+        MetricValue: "1"
+        DefaultValue: 0
+
+  AILValidationErrorsFilter:
+    Type: AWS::Logs::MetricFilter
+    Condition: DeployApplicationServicesAndHasAgentCoreLogGroup
+    Properties:
+      LogGroupName: !Ref AgentCoreLogGroupName
+      FilterPattern: '{ $.error_code = "AIL_ERR_009" || $.error_code = "AIL_ERR_010" }'
+      MetricTransformations:
+      - MetricNamespace: !Sub "AIL/${Environment}"
+        MetricName: AILValidationErrors
+        MetricValue: "1"
+        DefaultValue: 0
+
+  # --- Lambda Metric Filters (IS-XXXX error codes) ---
+
+  ConnectIngestionErrorsFilter:
+    Type: AWS::Logs::MetricFilter
+    Condition: DeployApplicationServices
+    DependsOn: LambdaLogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AppName}-${Environment}-interaction-stream-lambda"
+      FilterPattern: '{ $.error_code = "IS-1*" || $.error_code = "IS-2*" }'
+      MetricTransformations:
+      - MetricNamespace: !Sub "AIL/${Environment}"
+        MetricName: ConnectIngestionErrors
+        MetricValue: "1"
+        DefaultValue: 0
+
+  ConnectSessionErrorsFilter:
+    Type: AWS::Logs::MetricFilter
+    Condition: DeployApplicationServices
+    DependsOn: LambdaLogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AppName}-${Environment}-interaction-stream-lambda"
+      FilterPattern: '{ $.error_code = "IS-3*" }'
+      MetricTransformations:
+      - MetricNamespace: !Sub "AIL/${Environment}"
+        MetricName: ConnectSessionErrors
+        MetricValue: "1"
+        DefaultValue: 0
+
+  ConnectRedisErrorsByCodeFilter:
+    Type: AWS::Logs::MetricFilter
+    Condition: DeployApplicationServices
+    DependsOn: LambdaLogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AppName}-${Environment}-interaction-stream-lambda"
+      FilterPattern: '{ $.error_code = "IS-5*" }'
+      MetricTransformations:
+      - MetricNamespace: !Sub "AIL/${Environment}"
+        MetricName: ConnectRedisErrorsByCode
+        MetricValue: "1"
+        DefaultValue: 0
+
+  ConnectOrchestratorErrorsByCodeFilter:
+    Type: AWS::Logs::MetricFilter
+    Condition: DeployApplicationServices
+    DependsOn: LambdaLogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AppName}-${Environment}-interaction-stream-lambda"
+      FilterPattern: '{ $.error_code = "IS-6*" }'
+      MetricTransformations:
+      - MetricNamespace: !Sub "AIL/${Environment}"
+        MetricName: ConnectOrchestratorErrorsByCode
+        MetricValue: "1"
+        DefaultValue: 0
+
+  ConnectConfigAndUnexpectedErrorsFilter:
+    Type: AWS::Logs::MetricFilter
+    Condition: DeployApplicationServices
+    DependsOn: LambdaLogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AppName}-${Environment}-interaction-stream-lambda"
+      FilterPattern: '{ $.error_code = "IS-7*" || $.error_code = "IS-9*" }'
+      MetricTransformations:
+      - MetricNamespace: !Sub "AIL/${Environment}"
+        MetricName: ConnectUnexpectedErrors
+        MetricValue: "1"
+        DefaultValue: 0
+
+  # --- Lambda Metric Filters (event type) ---
+
+  ConnectValidationErrorsFilter:
+    Type: AWS::Logs::MetricFilter
+    Condition: DeployApplicationServices
+    DependsOn: LambdaLogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AppName}-${Environment}-interaction-stream-lambda"
+      FilterPattern: '{ $.level = "ERROR" && $.event_type = "ERROR" }'
+      MetricTransformations:
+      - MetricNamespace: !Sub "AIL/${Environment}"
+        MetricName: ConnectValidationErrors
+        MetricValue: "1"
+        DefaultValue: 0
+
+  ConnectRedisErrorsFilter:
+    Type: AWS::Logs::MetricFilter
+    Condition: DeployApplicationServices
+    DependsOn: LambdaLogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AppName}-${Environment}-interaction-stream-lambda"
+      FilterPattern: '{ $.event_type = "SESSION_WRITE" && $.level = "ERROR" }'
+      MetricTransformations:
+      - MetricNamespace: !Sub "AIL/${Environment}"
+        MetricName: ConnectRedisErrors
+        MetricValue: "1"
+        DefaultValue: 0
+
+  ConnectOrchestratorErrorsFilter:
+    Type: AWS::Logs::MetricFilter
+    Condition: DeployApplicationServices
+    DependsOn: LambdaLogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AppName}-${Environment}-interaction-stream-lambda"
+      # See AgentInvocationErrorsFilter: booleans need IS FALSE, not "= false".
+      FilterPattern: '{ $.event_type = "ORCHESTRATOR_INVOKE" && $.attributes.success IS FALSE }'
+      MetricTransformations:
+      - MetricNamespace: !Sub "AIL/${Environment}"
+        MetricName: ConnectOrchestratorErrors
+        MetricValue: "1"
+        DefaultValue: 0
+
+  ConnectOrchestratorLatencyFilter:
+    Type: AWS::Logs::MetricFilter
+    Condition: DeployApplicationServices
+    DependsOn: LambdaLogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AppName}-${Environment}-interaction-stream-lambda"
+      FilterPattern: '{ $.event_type = "ORCHESTRATOR_INVOKE" && $.attributes.latency_ms >= 0 }'
+      MetricTransformations:
+      - MetricNamespace: !Sub "AIL/${Environment}"
+        MetricName: ConnectOrchestratorLatencyMs
+        MetricValue: "$.attributes.latency_ms"
+        DefaultValue: 0
+
+  ConnectLambdaErrorsFilter:
+    Type: AWS::Logs::MetricFilter
+    Condition: DeployApplicationServices
+    DependsOn: LambdaLogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AppName}-${Environment}-interaction-stream-lambda"
+      FilterPattern: '{ $.level = "ERROR" }'
+      MetricTransformations:
+      - MetricNamespace: !Sub "AIL/${Environment}"
+        MetricName: ConnectLambdaErrors
+        MetricValue: "1"
+        DefaultValue: 0
+
+  # --- Alarms: AgentCore (event type) ---
+
+  AgentErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: DeployApplicationServicesAndHasAgentCoreLogGroup
+    Properties:
+      AlarmName: !Sub "${AppName}-${Environment}-agent-errors"
+      AlarmDescription: "Agent invocation failures exceeded threshold (§7.3: AgentErrors > 5 in 5min)"
+      Namespace: !Sub "AIL/${Environment}"
+      MetricName: AgentErrors
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  LLMLatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: DeployApplicationServicesAndHasAgentCoreLogGroup
+    Properties:
+      AlarmName: !Sub "${AppName}-${Environment}-llm-latency-p95"
+      AlarmDescription: "LLM call latency P95 exceeded 10s (§7.3: LLMLatencyMs p95 > 10000ms)"
+      Namespace: !Sub "AIL/${Environment}"
+      MetricName: LLMLatencyMs
+      ExtendedStatistic: p95
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 10000
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  LLMErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: DeployApplicationServicesAndHasAgentCoreLogGroup
+    Properties:
+      AlarmName: !Sub "${AppName}-${Environment}-llm-errors"
+      AlarmDescription: "Bedrock LLM errors or throttling detected"
+      Namespace: !Sub "AIL/${Environment}"
+      MetricName: LLMErrors
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 3
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  PushFailuresAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: DeployApplicationServicesAndHasAgentCoreLogGroup
+    Properties:
+      AlarmName: !Sub "${AppName}-${Environment}-push-failures"
+      AlarmDescription: "Push to FullServe/Helphub failing"
+      Namespace: !Sub "AIL/${Environment}"
+      MetricName: PushOutputErrors
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 3
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  WorkerErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: DeployApplicationServicesAndHasAgentCoreLogGroup
+    Properties:
+      AlarmName: !Sub "${AppName}-${Environment}-worker-errors"
+      AlarmDescription: "AgentCore worker thread crashed (WorkerErrors > 0 in 1min)"
+      Namespace: !Sub "AIL/${Environment}"
+      MetricName: WorkerErrors
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  # --- Alarms: Lambda (event type) ---
+
+  ConnectValidationErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: DeployApplicationServices
+    DependsOn: LambdaLogGroup
+    Properties:
+      AlarmName: !Sub "${AppName}-${Environment}-connect-validation-errors"
+      AlarmDescription: "Lambda validation errors exceeded threshold (§6.3: > 10 in 5min)"
+      Namespace: !Sub "AIL/${Environment}"
+      MetricName: ConnectValidationErrors
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  ConnectRedisErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: DeployApplicationServices
+    DependsOn: LambdaLogGroup
+    Properties:
+      AlarmName: !Sub "${AppName}-${Environment}-connect-redis-errors"
+      AlarmDescription: "Lambda Redis write failure detected (§6.3: > 0 in 1min)"
+      Namespace: !Sub "AIL/${Environment}"
+      MetricName: ConnectRedisErrors
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  ConnectOrchestratorErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: DeployApplicationServices
+    DependsOn: LambdaLogGroup
+    Properties:
+      AlarmName: !Sub "${AppName}-${Environment}-connect-orchestrator-errors"
+      AlarmDescription: "Lambda AgentCore invoke failures exceeded threshold (§6.3: > 5 in 5min)"
+      Namespace: !Sub "AIL/${Environment}"
+      MetricName: ConnectOrchestratorErrors
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  # --- Alarms: AgentCore error codes (AIL_ERR_XXX) with resolution steps ---
+
+  AILAgentDispatchErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: DeployApplicationServicesAndHasAgentCoreLogGroup
+    Properties:
+      AlarmName: !Sub "${AppName}-${Environment}-ail-agent-dispatch-errors"
+      AlarmDescription: !Sub |
+        AIL_ERR_001 (AGENT_FAILURE): Agent failed with unexpected error - retriable.
+        AIL_ERR_002 (DISPATCH_ERROR): Agent dispatch failed during execution - retriable.
+        Resolution:
+        1. Check AgentCore logs: CloudWatch > Log groups > /aws/bedrock-agentcore/runtime/colleague_assist_orchestrator_${Environment}* > filter error_code="AIL_ERR_001" OR "AIL_ERR_002"
+        2. Look at attributes.agent_name to identify which agent failed
+        3. Common causes: LLM returned unexpected format, tool endpoint timeout, config YAML invalid
+        4. If retriable errors persist, check Bedrock model availability and Redis connectivity
+      Namespace: !Sub "AIL/${Environment}"
+      MetricName: AILAgentDispatchErrors
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 3
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  AILConfigRoutingErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: DeployApplicationServicesAndHasAgentCoreLogGroup
+    Properties:
+      AlarmName: !Sub "${AppName}-${Environment}-ail-config-routing-errors"
+      AlarmDescription: !Sub |
+        AIL_ERR_003 (CONFIG_LOAD_ERROR): Agent config YAML could not be loaded - non-retriable.
+        AIL_ERR_006 (ROUTING_ERROR): No workflow route matched current phase + event - non-retriable.
+        AIL_ERR_013 (MALFORMED_CONDITION): Workflow condition expression is invalid - non-retriable.
+        Resolution:
+        1. Check AgentCore logs: filter error_code="AIL_ERR_003" OR "AIL_ERR_006" OR "AIL_ERR_013"
+        2. ERR_003: Verify configs/BUK/agents/*.yaml exist and are valid YAML
+        3. ERR_006: Check workflow.yaml - the event+phase combo has no matching route
+        4. ERR_013: Check workflow.yaml condition expressions - syntax error in condition string
+      Namespace: !Sub "AIL/${Environment}"
+      MetricName: AILConfigRoutingErrors
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  AILOrchestratorPushErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: DeployApplicationServicesAndHasAgentCoreLogGroup
+    Properties:
+      AlarmName: !Sub "${AppName}-${Environment}-ail-orchestrator-push-errors"
+      AlarmDescription: !Sub |
+        AIL_ERR_004 (ORCHESTRATOR_ERROR): Orchestrator invocation failed - retriable.
+        AIL_ERR_007 (PUSH_FAILURE): Failed to push advisory to FullServe/Helphub - retriable.
+        Resolution:
+        1. Check AgentCore logs: filter error_code="AIL_ERR_004" OR "AIL_ERR_007"
+        2. ERR_004: Check Redis connectivity, emit chain LPUSH, phase persistence
+        3. ERR_007: Check PUSH_ENDPOINT env var, verify FullServe/Helphub is reachable
+        4. If circuit breaker is OPEN, push will auto-resume after 300s cooldown
+      Namespace: !Sub "AIL/${Environment}"
+      MetricName: AILOrchestratorPushErrors
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 3
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  AILSessionStateErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: DeployApplicationServicesAndHasAgentCoreLogGroup
+    Properties:
+      AlarmName: !Sub "${AppName}-${Environment}-ail-session-state-errors"
+      AlarmDescription: !Sub |
+        AIL_ERR_005 (SESSION_NOT_FOUND): No session state in Redis - non-retriable.
+        AIL_ERR_011 (CORRUPT_SESSION_STATE): Session state from Redis failed schema validation - non-retriable.
+        AIL_ERR_012 (CORRUPT_QUEUE_ENTRY): Queue entry from Redis failed validation - non-retriable.
+        Resolution:
+        1. Check AgentCore logs: filter error_code="AIL_ERR_005" OR "AIL_ERR_011" OR "AIL_ERR_012"
+        2. ERR_005: Session TTL expired (24h) or Lambda never wrote initial state
+        3. ERR_011: Session state corrupted - possibly by non-atomic merge race condition
+        4. ERR_012: Event queue entry malformed - check emit chain for serialization issues
+      Namespace: !Sub "AIL/${Environment}"
+      MetricName: AILSessionStateErrors
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  AILGuardrailTriggeredAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: DeployApplicationServicesAndHasAgentCoreLogGroup
+    Properties:
+      AlarmName: !Sub "${AppName}-${Environment}-ail-guardrail-triggered"
+      AlarmDescription: !Sub |
+        AIL_ERR_008 (GUARDRAIL_TRIGGERED): Bedrock content guardrail blocked the response - non-retriable.
+        Resolution:
+        1. Check AgentCore logs: filter error_code="AIL_ERR_008"
+        2. Look at attributes.agent_name to see which agent's prompt was blocked
+        3. Review guardrail config: ${AppName}-${Environment}-bedrock-guardrail in Bedrock console
+        4. Common causes: customer transcript contains strong language triggering content filters
+        5. If false positive, adjust guardrail filter strengths or prompt template
+      Namespace: !Sub "AIL/${Environment}"
+      MetricName: AILGuardrailTriggered
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 3
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  AILValidationErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: DeployApplicationServicesAndHasAgentCoreLogGroup
+    Properties:
+      AlarmName: !Sub "${AppName}-${Environment}-ail-validation-errors"
+      AlarmDescription: !Sub |
+        AIL_ERR_009 (INVALID_REQUEST): Request payload is invalid - non-retriable.
+        AIL_ERR_010 (INVALID_PHASE_TRANSITION): Phase transition not permitted - non-retriable.
+        Resolution:
+        1. Check AgentCore logs: filter error_code="AIL_ERR_009" OR "AIL_ERR_010"
+        2. ERR_009: Frontend sending bad payload - check event_category, event_action, session_id format
+        3. ERR_010: Event arrived for a phase that doesn't accept it - check workflow.yaml phase routes
+        4. If spike, check if frontend deployed a breaking change or workflow.yaml was updated
+      Namespace: !Sub "AIL/${Environment}"
+      MetricName: AILValidationErrors
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  # --- Alarms: Lambda error codes (IS-XXXX) with resolution steps ---
+
+  ConnectIngestionErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: DeployApplicationServices
+    DependsOn: LambdaLogGroup
+    Properties:
+      AlarmName: !Sub "${AppName}-${Environment}-connect-ingestion-errors"
+      AlarmDescription: !Sub |
+        IS-1001 (MALFORMED_KINESIS_PAYLOAD): Base64/JSON decode failure - non-retriable.
+        IS-1002 (EMPTY_RECORD_PAYLOAD): Decoded payload was empty - non-retriable.
+        IS-2001 (MISSING_CONTACT_ID): ContactId field missing - non-retriable.
+        IS-2002 (UNSUPPORTED_EVENT_TYPE): EventType not in valid set - non-retriable.
+        IS-2003 (MISSING_EVENT_TYPE): EventType field missing entirely - non-retriable.
+        Resolution:
+        1. Check Lambda logs: /aws/lambda/${AppName}-${Environment}-interaction-stream-lambda > filter error_code="IS-1*" OR "IS-2*"
+        2. These are bad records from upstream (Contact Lens) - retrying won't help
+        3. If spike, check Contact Lens real-time stream config or upstream schema changes
+      Namespace: !Sub "AIL/${Environment}"
+      MetricName: ConnectIngestionErrors
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  ConnectSessionErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: DeployApplicationServices
+    DependsOn: LambdaLogGroup
+    Properties:
+      AlarmName: !Sub "${AppName}-${Environment}-connect-session-errors"
+      AlarmDescription: !Sub |
+        IS-3001 (OUT_OF_ORDER_EVENT): Session bootstrapped by non-INITIATED event - non-retriable.
+        IS-3002 (DUPLICATE_INITIATED_EVENT): CONTACT_INITIATED on existing session - non-retriable.
+        IS-3003 (SESSION_STATE_SCHEMA_MISMATCH): State doesn't match expected schema - non-retriable.
+        Resolution:
+        1. Check Lambda logs: filter error_code="IS-3*"
+        2. IS-3001: Events arrived out of order - SEGMENTS before STARTED
+        3. IS-3002: Duplicate STARTED event - harmless if occasional
+        4. IS-3003: state_schema.json changed but existing Redis sessions have old schema
+      Namespace: !Sub "AIL/${Environment}"
+      MetricName: ConnectSessionErrors
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  ConnectRedisErrorsByCodeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: DeployApplicationServices
+    DependsOn: LambdaLogGroup
+    Properties:
+      AlarmName: !Sub "${AppName}-${Environment}-connect-redis-errors-by-code"
+      AlarmDescription: !Sub |
+        IS-5001 (REDIS_CONNECTION_ERROR): Cannot connect to Redis - retriable.
+        IS-5002 (REDIS_TIMEOUT): Redis operation timed out - retriable.
+        IS-5003 (REDIS_MERGE_FAILURE): Both atomic Lua and fallback merge failed - retriable.
+        Resolution:
+        1. Check Lambda logs: filter error_code="IS-5*"
+        2. IS-5001: Check security group (port 6379), VPC endpoint, Redis node health
+        3. IS-5002: Check ElastiCache CPU/memory metrics, connection count
+        4. IS-5003: Concurrent write conflict - Lambda and AgentCore both writing to same session
+        5. All retriable - Kinesis will redeliver via batchItemFailures
+      Namespace: !Sub "AIL/${Environment}"
+      MetricName: ConnectRedisErrorsByCode
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  ConnectOrchestratorErrorsByCodeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: DeployApplicationServices
+    DependsOn: LambdaLogGroup
+    Properties:
+      AlarmName: !Sub "${AppName}-${Environment}-connect-orchestrator-errors-by-code"
+      AlarmDescription: !Sub |
+        IS-6001 (ORCHESTRATOR_INVOCATION_FAILED): AgentCore invoke call failed - retriable.
+        IS-6002 (INVALID_ORCHESTRATOR_PAYLOAD_CONTRACT): Payload doesn't match InvokeRequest - non-retriable.
+        IS-6003 (INVALID_UTTERANCE_SHAPE): Utterance dict doesn't match expected shape - non-retriable.
+        IS-6004 (INVALID_CATEGORIZATION_RESULT_TYPE): matched_categories not list[str] - non-retriable.
+        Resolution:
+        1. Check Lambda logs: filter error_code="IS-6*"
+        2. IS-6001: AgentCore down - check health, VPC endpoint, SigV4 credentials
+        3. IS-6002: event_category/event_action mismatch - check event_config.json
+        4. IS-6003/6004: Contact Lens schema changed - check transformer.py field mapping
+      Namespace: !Sub "AIL/${Environment}"
+      MetricName: ConnectOrchestratorErrorsByCode
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  ConnectUnexpectedErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: DeployApplicationServices
+    DependsOn: LambdaLogGroup
+    Properties:
+      AlarmName: !Sub "${AppName}-${Environment}-connect-unexpected-errors"
+      AlarmDescription: !Sub |
+        IS-7001 (CONFIG_LOAD_FAILURE): Failed to load config from S3 - retriable.
+        IS-9001 (UNEXPECTED_ERROR): Unhandled exception - retriable (to avoid silent data loss).
+        Resolution:
+        1. Check Lambda logs: filter error_code="IS-7*" OR "IS-9*"
+        2. IS-7001: S3 config bucket unreachable or config JSON invalid
+        3. IS-9001: Unclassified exception - check full stack trace. Investigate and reclassify
+        4. Both retriable - Kinesis will redeliver. If persistent, fix the underlying cause
+      Namespace: !Sub "AIL/${Environment}"
+      MetricName: ConnectUnexpectedErrors
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+Outputs:
+  ArtifactsBucketName:
+    Description: Static S3 bucket for Lambda deployment artifacts
+    Value: !Ref ArtifactsBucket
+  ArtifactsBucketArn:
+    Description: ARN of the static artifacts bucket
+    Value: !GetAtt ArtifactsBucket.Arn
+  ArtifactsKmsKeyId:
+    Description: ID of the KMS key used by the artifacts bucket
+    Value: !Ref ArtifactsKmsKey
+  ArtifactsKmsKeyArn:
+    Description: ARN of the KMS key used by the artifacts bucket
+    Value: !GetAtt ArtifactsKmsKey.Arn
+  
+  # ---------------------------------------------------------------------------
+  # Security Groups
+  # ---------------------------------------------------------------------------
+  
+  RedisSecurityGroupId:
+    Condition: DeployApplicationServices
+    Description: Redis additional security group ID.
+    Value: !Ref RedisAdditionalSecurityGroup
+    Export:
+      Name: !Sub "${AppName}-${Environment}-redis-sg-id"
+
+  LambdaSecurityGroupId:
+    Condition: DeployApplicationServices
+    Description: Lambda security group ID.
+    Value: !Ref LambdaSecurityGroup
+    Export:
+      Name: !Sub "${AppName}-${Environment}-lambda-sg-id"
+
+  AgentCoreSecurityGroupId:
+    Condition: DeployApplicationServices
+    Description: AgentCore additional security group ID.
+    Value: !Ref AgentCoreAdditionalSecurityGroup
+    Export:
+      Name: !Sub "${AppName}-${Environment}-agentcore-sg-id"
+
+  # ---------------------------------------------------------------------------
+  # Lambda
+  # ---------------------------------------------------------------------------
+  LambdaFunctionName:
+    Condition: DeployApplicationServices
+    Description: Lambda function name.
+    Value: !Ref InteractionStreamLambda
+    Export:
+      Name: !Sub "${AppName}-${Environment}-lambda-name"
+
+  LambdaFunctionArn:
+    Condition: DeployApplicationServices
+    Description: Lambda function ARN.
+    Value: !GetAtt InteractionStreamLambda.Arn
+    Export:
+      Name: !Sub "${AppName}-${Environment}-lambda-arn"
+
+  LambdaLogGroupName:
+    Condition: DeployApplicationServices
+    Description: CloudWatch log group for the Interaction Stream Lambda.
+    Value: !Ref LambdaLogGroup
+
+  LambdaExecutionRoleArn:
+    Condition: DeployApplicationServices
+    Description: Lambda execution role ARN.
+    Value: !GetAtt InteractionStreamLambdaExecutionRole.Arn
+    Export:
+      Name: !Sub "${AppName}-${Environment}-lambda-role-arn"
+
+  # ---------------------------------------------------------------------------
+  # AgentCore
+  # ---------------------------------------------------------------------------
+  AgentCoreExecutionRoleArn:
+    Condition: DeployApplicationServices
+    Description: AgentCore runtime execution role ARN.
+    Value: !GetAtt AgentCoreRuntimeExecutionRole.Arn
+    Export:
+      Name: !Sub "${AppName}-${Environment}-agentcore-role-arn"
+
+  # ---------------------------------------------------------------------------
+  # Redis
+  # ---------------------------------------------------------------------------
+  RedisSecretArn:
+    Condition: DeployApplicationServices
+    Description: Redis auth secret ARN from Service Catalog provisioned product.
+    Value: !GetAtt RedisProvisionedProduct.Outputs.CacheSecretArn
+    Export:
+      Name: !Sub "${AppName}-${Environment}-redis-secret-arn"
+
+  # ---------------------------------------------------------------------------
+  # Guardrail
+  # ---------------------------------------------------------------------------
+  GuardrailId:
+    Condition: DeployApplicationServices
+    Description: Bedrock Guardrail ID.
+    Value: !GetAtt BedrockGuardrail.GuardrailId
+    Export:
+      Name: !Sub "${AppName}-${Environment}-guardrail-id"
+
+  GuardrailVersion:
+    Condition: DeployApplicationServices
+    Description: Bedrock Guardrail version.
+    Value: !GetAtt BedrockGuardrail.Version
+    Export:
+      Name: !Sub "${AppName}-${Environment}-guardrail-version"
+
+  BedrockGuardrailKmsKeyArn:
+    Condition: DeployApplicationServices
+    Description: KMS key ARN for Bedrock Guardrail encryption.
+    Value: !GetAtt BedrockGuardrailKmsKey.Arn
+    Export:
+      Name: !Sub "${AppName}-${Environment}-bedrock-guardrail-kms-arn"
+
+  # ---------------------------------------------------------------------------
+  # SQS FIFO Queue
+  # ---------------------------------------------------------------------------
+  SqsQueueArn:
+    Condition: DeployApplicationServices
+    Description: SQS FIFO queue ARN.
+    Value: !GetAtt SqsFifoQueue.Arn
+    Export:
+      Name: !Sub "${AppName}-${Environment}-sqs-queue-arn"
+
+  SqsQueueUrl:
+    Condition: DeployApplicationServices
+    Description: SQS FIFO queue URL.
+    Value: !Ref SqsFifoQueue
+    Export:
+      Name: !Sub "${AppName}-${Environment}-sqs-queue-url"
+
+  SqsDLQArn:
+    Condition: DeployApplicationServices
+    Description: SQS FIFO dead-letter queue ARN.
+    Value: !GetAtt SqsDeadLetterQueue.Arn
+    Export:
+      Name: !Sub "${AppName}-${Environment}-sqs-dlq-arn"
+
+  ForwarderRoleArn:
+    Condition: DeployApplicationServicesAndHasCrossAccountForwarder
+    Description: Cross-account IAM role ARN for the SQS forwarder Lambda to assume.
+    Value: !GetAtt SqsForwarderCrossAccountRole.Arn
+    Export:
+      Name: !Sub "${AppName}-${Environment}-sqs-forwarder-role-arn"
+
+  # ---------------------------------------------------------------------------
+  # Common Config
+  # ---------------------------------------------------------------------------
+  CommonConfigParameterPath:
+    Condition: DeployApplicationServices
+    Description: SSM parameter path for common config (push endpoints, TIAA auth, circuit breaker).
+    Value: !Sub "/ail/${Environment}/network/common/config"
+    Export:
+      Name: !Sub "${AppName}-${Environment}-common-config-path"
